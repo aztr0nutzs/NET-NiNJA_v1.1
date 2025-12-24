@@ -1,0 +1,44 @@
+Worklog
+2025-12-13
+
+Added a dependency-free holographic WiFi discovery map UI (ui/holo_map/) and a local Python map server (bin/netreaper-map).
+
+Added wifi_scan_json in lib/wireless.sh and exposed it via netreaper wifi scan.
+
+Added netreaper wifi map to serve the UI and read ~/.netreaper/output/wifi_scan_latest.json.
+
+Updated documentation and Bats tests.
+
+How to run
+
+netreaper wifi scan <iface>
+
+netreaper wifi map 8787
+
+Open http://127.0.0.1:8787/
+
+2025-12-16
+
+GUI history sharing: Modified gui/netreaper_gui.py to load recent targets from ~/.netreaper/history/scans.log or targets.log. Added a _load_target_history method in NetReaperGui that reads up to 20 entries and assigns them to self.target_history. When registering new TargetField instances, they now receive the global history instead of only their own current value. This improves user experience by remembering targets across sessions and across tabs.
+
+Interface detection fallback: Updated the Wireless tab’s refresh_interfaces to fall back to enumerating /sys/class/net when iw dev yields no results. This prevents the interface list from being empty on systems lacking iw or with non-reporting wireless adapters.
+
+Handshake capture fix: Corrected the airodump-ng command used in capture_handshake to use the -c flag for channel selection. The previous --channel option was invalid and caused handshake captures to fail.
+
+Stop tasks button: Added a Stop tasks action to the GUI toolbar. When invoked, it terminates all running CommandThread processes and clears the active thread list. This gives users control to abort long‑running scans or attacks without closing the application.
+
+Lite mode toggle: Implemented a checkable Lite mode toggle on the toolbar. When enabled, the GUI prefixes all shell commands with NR_LITE_MODE=1, triggering low‑resource behaviour in the CLI modules and wizards. A status message in the log indicates when Lite mode is toggled on or off.
+
+Tool availability check: Updated execute_command to use shutil.which to verify that the command’s executable exists before attempting to run it. If the executable is not found (e.g., missing nmap or airodump-ng), the GUI pops up a warning and skips execution instead of failing silently.
+
+Shared BSSID history: Added a bssid_history list to the main GUI, with register_bssid_field and add_bssid_history methods. The wireless tab registers its BSSID field, so when a user runs deauth, WPS or handshake capture, the BSSID is stored and available for auto‑completion across sessions.
+
+How to test
+
+Launch the GUI using python3 gui/netreaper_gui.py.
+
+Observe that previously used targets (if any exist in ~/.netreaper/history) are available in the target drop‑downs across the SCAN, RECON, WIRELESS, and WEB tabs.
+
+On a system without iw, open the WIRELESS tab and click “Refresh”. The interface selector should populate with non‑loopback network interfaces from /sys/class/net.
+
+Test handshake capture by selecting a BSSID and channel; ensure that airodump-ng uses the short -c flag and creates /tmp/handshake* files successfully

@@ -1,0 +1,319 @@
+NetReaper Windows GUI - Copy-Paste Commands
+===========================================
+
+STEP 1: CHECK PYTHON
+--------------------
+python --version
+pip --version
+
+Expected: Python 3.8+ and pip version numbers
+If error: Install Python from python.org (check "Add to PATH")
+
+
+STEP 2: NAVIGATE TO FOLDER
+---------------------------
+# Replace with your actual path
+cd C:\Users\YourName\Downloads\Net.Reaper-rebuild-main
+
+# Verify you're in the right place
+dir
+
+Expected: You should see netreaper_gui_windows.py
+
+
+STEP 3: INSTALL DEPENDENCIES
+-----------------------------
+pip install -r requirements_windows.txt
+
+Expected: "Successfully installed PyQt6..."
+
+
+STEP 4: VERIFY INSTALLATION
+----------------------------
+python -c "import PyQt6; print('Success!')"
+
+Expected: "Success!"
+
+
+STEP 5: LAUNCH GUI
+------------------
+# Method 1 (Easiest)
+.\launch_gui.bat
+
+# Method 2 (PowerShell)
+.\launch_gui.ps1
+
+# Method 3 (Direct)
+python netreaper_gui_windows.py
+
+
+OPTIONAL: CREATE DESKTOP SHORTCUT
+----------------------------------
+.\create_shortcut.ps1
+
+
+TROUBLESHOOTING COMMANDS
+========================
+
+Fix: Python not found
+---------------------
+# After installing Python, restart PowerShell
+
+
+Fix: pip not found
+------------------
+python -m ensurepip --upgrade
+
+
+Fix: pip upgrade needed
+-----------------------
+python -m pip install --upgrade pip
+
+
+Fix: PyQt6 installation failed
+-------------------------------
+python -m pip install --upgrade pip
+pip install PyQt6
+
+
+Fix: PowerShell script execution blocked
+-----------------------------------------
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+
+Fix: Access denied
+------------------
+# Run PowerShell as Administrator:
+# Press Win+X, select "Windows PowerShell (Admin)"
+
+
+Fix: Check if PyQt6 is installed
+---------------------------------
+pip list | findstr PyQt6
+
+
+Fix: Uninstall and reinstall PyQt6
+-----------------------------------
+pip uninstall PyQt6 PyQt6-Qt6 PyQt6-sip
+pip install PyQt6
+
+
+TESTING COMMANDS (After GUI is running)
+========================================
+
+Test 1: In Command Input (bottom of GUI)
+-----------------------------------------
+Test-NetConnection google.com
+
+
+Test 2: In Command Input
+-------------------------
+ipconfig
+
+
+Test 3: In Command Input
+-------------------------
+netstat -ano
+
+
+Test 4: In Command Input
+-------------------------
+nslookup google.com
+
+
+SYSTEM INFORMATION COMMANDS
+===========================
+
+Check Windows version
+---------------------
+winver
+
+
+Check system info
+-----------------
+systeminfo | findstr /C:"OS"
+
+
+Check Python location
+---------------------
+where python
+
+
+Check pip location
+------------------
+where pip
+
+
+List installed packages
+-----------------------
+pip list
+
+
+Check disk space
+----------------
+wmic logicaldisk get size,freespace,caption
+
+
+NETWORK COMMANDS (For testing in GUI)
+======================================
+
+Show network adapters
+---------------------
+ipconfig /all
+
+
+Show WiFi networks
+------------------
+netsh wlan show networks
+
+
+Show WiFi profiles
+------------------
+netsh wlan show profiles
+
+
+Show routing table
+------------------
+route print
+
+
+Show ARP table
+--------------
+arp -a
+
+
+Show active connections
+-----------------------
+netstat -ano
+
+
+Test connectivity
+-----------------
+Test-NetConnection google.com -Port 443
+
+
+Trace route
+-----------
+tracert google.com
+
+
+DNS lookup
+----------
+nslookup google.com
+
+
+ADVANCED COMMANDS
+=================
+
+Install optional tools via Chocolatey
+--------------------------------------
+# First install Chocolatey (run as Admin):
+Set-ExecutionPolicy Bypass -Scope Process -Force
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+# Then install tools:
+choco install nmap
+choco install wireshark
+
+
+Create virtual environment (optional)
+--------------------------------------
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements_windows.txt
+
+
+UNINSTALL COMMANDS
+==================
+
+Uninstall PyQt6
+---------------
+pip uninstall PyQt6 PyQt6-Qt6 PyQt6-sip
+
+
+Remove config directory
+-----------------------
+Remove-Item -Recurse -Force "$env:APPDATA\NetReaper"
+
+
+QUICK REFERENCE
+===============
+
+Installation: 3 commands
+-------------------------
+1. cd path\to\Net.Reaper-rebuild-main
+2. pip install -r requirements_windows.txt
+3. .\launch_gui.bat
+
+
+Verification: 2 commands
+------------------------
+1. python --version
+2. python -c "import PyQt6; print('OK')"
+
+
+Launch: 1 command
+-----------------
+.\launch_gui.bat
+
+
+COMMON PATHS
+============
+
+Python (typical locations):
+- C:\Users\YourName\AppData\Local\Programs\Python\Python3XX
+- C:\Python3XX
+
+Config directory:
+- %APPDATA%\NetReaper
+- C:\Users\YourName\AppData\Roaming\NetReaper
+
+Temp directory:
+- %TEMP%
+- C:\Users\YourName\AppData\Local\Temp
+
+
+FILE LOCATIONS
+==============
+
+Main application:
+- netreaper_gui_windows.py
+
+Launchers:
+- launch_gui.bat
+- launch_gui.ps1
+- create_shortcut.ps1
+
+Documentation:
+- INSTALL_NOW.md (Quick install guide)
+- README_WINDOWS.md (Full user guide)
+- QUICKSTART_WINDOWS.md (5-minute guide)
+
+Dependencies:
+- requirements_windows.txt
+
+
+SUPPORT
+=======
+
+Documentation:
+- INSTALL_NOW.md → Step-by-step installation
+- README_WINDOWS.md → Complete user guide
+- INSTALL_WINDOWS.md → Detailed troubleshooting
+
+GitHub:
+- Issues: Report bugs
+- Discussions: Ask questions
+
+
+VERSION INFO
+============
+
+Version: 1.0.0
+Platform: Windows 10/11
+Python: 3.8+
+License: Apache 2.0
+
+
+© 2025 Nerds489

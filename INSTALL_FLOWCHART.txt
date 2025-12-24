@@ -1,0 +1,147 @@
+NetReaper Windows GUI - Installation Flowchart
+==============================================
+
+START
+  |
+  v
+┌─────────────────────────────────────┐
+│ Do you have Python installed?       │
+│ Run: python --version               │
+└──────────┬──────────────────────────┘
+           |
+     ┌─────┴─────┐
+     |           |
+    YES         NO
+     |           |
+     |           v
+     |    ┌──────────────────────────┐
+     |    │ Install Python           │
+     |    │ 1. Go to python.org      │
+     |    │ 2. Download installer    │
+     |    │ 3. ✓ Add to PATH         │
+     |    │ 4. Install               │
+     |    └──────────┬───────────────┘
+     |               |
+     └───────┬───────┘
+             |
+             v
+┌─────────────────────────────────────┐
+│ Open PowerShell/CMD in              │
+│ Net.Reaper-rebuild-main folder      │
+│                                     │
+│ Method 1: File Explorer             │
+│ - Navigate to folder                │
+│ - Type "powershell" in address bar  │
+│                                     │
+│ Method 2: CD command                │
+│ - cd C:\path\to\folder              │
+└──────────┬──────────────────────────┘
+           |
+           v
+┌─────────────────────────────────────┐
+│ Install Dependencies                │
+│ Run: pip install -r                 │
+│      requirements_windows.txt       │
+│                                     │
+│ Wait 1-2 minutes...                 │
+└──────────┬──────────────────────────┘
+           |
+           v
+┌─────────────────────────────────────┐
+│ Verify Installation                 │
+│ Run: python -c "import PyQt6"       │
+└──────────┬──────────────────────────┘
+           |
+     ┌─────┴─────┐
+     |           |
+   ERROR      SUCCESS
+     |           |
+     v           v
+┌─────────┐  ┌──────────────────────────┐
+│ Retry:  │  │ Launch GUI               │
+│ 1. pip  │  │                          │
+│ upgrade │  │ Choose one:              │
+│ 2. pip  │  │ A) .\launch_gui.bat      │
+│ install │  │ B) .\launch_gui.ps1      │
+│ PyQt6   │  │ C) python                │
+└─────────┘  │    netreaper_gui_        │
+             │    windows.py            │
+             └──────────┬───────────────┘
+                        |
+                        v
+             ┌──────────────────────────┐
+             │ GUI Window Opens!        │
+             │                          │
+             │ You should see:          │
+             │ - Dark theme             │
+             │ - Multiple tabs          │
+             │ - Animated HUD           │
+             │ - Output log             │
+             └──────────┬───────────────┘
+                        |
+                        v
+             ┌──────────────────────────┐
+             │ Test Basic Function      │
+             │                          │
+             │ 1. Click SCAN tab        │
+             │ 2. Click "Scan Networks" │
+             │ 3. Select an IP          │
+             │ 4. Click "Quick Test"    │
+             │ 5. See output            │
+             └──────────┬───────────────┘
+                        |
+                  ┌─────┴─────┐
+                  |           |
+                ERROR      SUCCESS
+                  |           |
+                  v           v
+         ┌────────────┐  ┌──────────────┐
+         │ Check:     │  │ DONE!        │
+         │ - Errors   │  │              │
+         │ - Firewall │  │ Optional:    │
+         │ - Antivirus│  │ Create       │
+         │            │  │ desktop      │
+         │ See        │  │ shortcut:    │
+         │ INSTALL_   │  │              │
+         │ NOW.md     │  │ .\create_    │
+         │ Trouble-   │  │ shortcut.ps1 │
+         │ shooting   │  │              │
+         └────────────┘  └──────────────┘
+                              |
+                              v
+                         ┌─────────────┐
+                         │ Start using │
+                         │ NetReaper!  │
+                         └─────────────┘
+
+
+QUICK REFERENCE
+===============
+
+Minimum Requirements:
+- Windows 10 or 11
+- Python 3.8+
+- 2 GB RAM
+- Internet connection
+
+Installation Time:
+- With Python: ~5 minutes
+- Without Python: ~10 minutes
+
+Commands Summary:
+1. python --version          (Check Python)
+2. cd path\to\folder         (Navigate)
+3. pip install -r requirements_windows.txt  (Install)
+4. .\launch_gui.bat          (Run)
+
+Troubleshooting:
+- Python not found → Reinstall with "Add to PATH"
+- pip not found → python -m ensurepip
+- PyQt6 error → pip install --upgrade pip
+- Access denied → Run as Administrator
+- Scripts blocked → Set-ExecutionPolicy RemoteSigned
+
+Support:
+- INSTALL_NOW.md → Step-by-step guide
+- README_WINDOWS.md → Full documentation
+- INSTALL_WINDOWS.md → Detailed troubleshooting
