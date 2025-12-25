@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Dict
 
+from feature_matrix import get_feature_matrix, resolve_feature_support, serialize_feature_matrix
+
 
 @dataclass
 class CapabilityMatrix:
@@ -18,6 +20,8 @@ class CapabilityMatrix:
     tools: Dict[str, bool] = field(default_factory=dict)
     feature_flags: Dict[str, bool] = field(default_factory=dict)
     reasons: Dict[str, str] = field(default_factory=dict)
+    feature_support: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    feature_matrix: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
     def flag(self, name: str) -> bool:
         return bool(self.feature_flags.get(name, False))
@@ -171,6 +175,12 @@ def detect_capabilities() -> CapabilityMatrix:
             if feature_flags.get(flag, False):
                 reasons.setdefault(flag, "Admin privileges recommended for full results")
 
+    matrix = get_feature_matrix()
+    os_key = "windows" if is_windows else "linux"
+    feature_support: Dict[str, Dict[str, object]] = {}
+    for key, defn in matrix.items():
+        feature_support[key] = resolve_feature_support(defn, os_key, tools, is_admin)
+
     return CapabilityMatrix(
         platform=platform.system(),
         is_windows=is_windows,
@@ -180,4 +190,6 @@ def detect_capabilities() -> CapabilityMatrix:
         tools=tools,
         feature_flags=feature_flags,
         reasons=reasons,
+        feature_support=feature_support,
+        feature_matrix=serialize_feature_matrix(matrix),
     )

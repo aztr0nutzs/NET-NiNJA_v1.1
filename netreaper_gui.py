@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, pyqtSignal, QUrl, QSettings, QByteArray
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, QEventLoop, Qt, pyqtSignal, QUrl, QSettings, QByteArray
 
 import shutil  # For checking tool availability
 
@@ -494,7 +494,7 @@ class WizardTab(QWidget):
         # Launch button
         self.launch_button = create_glowing_button("Deploy Reaper Mode", self.launch_reaper)
         if self.main_window:
-            self.main_window.guard_button(self.launch_button, required_tools=["netreaper"])
+            self.main_window.apply_feature_support(self.launch_button, "wizard.reaper_mode")
         self.layout.addWidget(self.launch_button)
 
         # Initialize UI
@@ -572,7 +572,7 @@ class WizardTab(QWidget):
             self.launch_button.setEnabled(True)
             return
 
-        job_id = self.main_window.execute_command(command, description)
+        job_id = self.main_window.submit_command_job(command, description, feature_key="wizard.reaper_mode")
         if not job_id:
             self.status_label.setText("Wizard start failed")
             self.progress.setVisible(False)
@@ -891,7 +891,7 @@ class ScanTab(CategoryTab):
         self.preset_combo.addItems(list(self.scan_presets.keys()))
         layout.addWidget(self.preset_combo)
         initiate_btn = create_glowing_button("Initiate Sequencing", self.run_selected_preset)
-        self.main_window.guard_button(initiate_btn, required_tools=["nmap"])
+        self.main_window.apply_feature_support(initiate_btn, "discovery.nmap_standard")
         layout.addWidget(initiate_btn)
         layout.addStretch()
         return container
@@ -903,27 +903,27 @@ class ScanTab(CategoryTab):
 
         grid.addWidget(QLabel("Initiate genome sequencing across common vectors."), 0, 0, 1, 2)
         quick_button = create_glowing_button("Rapid Sequencing (nmap -T4 -F)", self.run_quick)
-        self.main_window.guard_button(quick_button, required_tools=["nmap"])
+        self.main_window.apply_feature_support(quick_button, "discovery.nmap_standard")
         grid.addWidget(quick_button, 1, 0)
 
         full_button = create_glowing_button("Full Genome Scan (-sS -sV -A -p-)", self.run_full)
-        self.main_window.guard_button(full_button, required_tools=["nmap"], require_admin=True)
+        self.main_window.apply_feature_support(full_button, "discovery.nmap_full")
         grid.addWidget(full_button, 1, 1)
 
         stealth_button = create_glowing_button("Stealth Vector (-sS -T2 -f)", self.run_stealth)
-        self.main_window.guard_button(stealth_button, required_tools=["nmap"], require_admin=True)
+        self.main_window.apply_feature_support(stealth_button, "discovery.nmap_full")
         grid.addWidget(stealth_button, 2, 0)
 
         udp_button = create_glowing_button("UDP Vector Scan (--top-ports 100)", self.run_udp)
-        self.main_window.guard_button(udp_button, required_tools=["nmap"], require_admin=True)
+        self.main_window.apply_feature_support(udp_button, "discovery.nmap_full")
         grid.addWidget(udp_button, 2, 1)
 
         vuln_button = create_glowing_button("Vulnerability Assay (--script vuln)", self.run_vuln)
-        self.main_window.guard_button(vuln_button, required_tools=["nmap"])
+        self.main_window.apply_feature_support(vuln_button, "discovery.nmap_standard")
         grid.addWidget(vuln_button, 3, 0)
 
         service_button = create_glowing_button("Service Fingerprinting (-sV)", self.run_service)
-        self.main_window.guard_button(service_button, required_tools=["nmap"])
+        self.main_window.apply_feature_support(service_button, "discovery.nmap_standard")
         grid.addWidget(service_button, 3, 1)
 
         return container
@@ -962,42 +962,42 @@ class ScanTab(CategoryTab):
         if not target:
             return
         cmd = f"nmap -T4 -F {quote(target)}"
-        self.executor(cmd, "Quick scan", target=target)
+        self.executor(cmd, "Quick scan", target=target, feature_key="discovery.nmap_standard")
 
     def run_full(self) -> None:
         target = self.validate_target()
         if not target:
             return
         cmd = f"sudo nmap -sS -sV -sC -A -p- {quote(target)}"
-        self.executor(cmd, "Full scan", target=target)
+        self.executor(cmd, "Full scan", target=target, feature_key="discovery.nmap_full")
 
     def run_stealth(self) -> None:
         target = self.validate_target()
         if not target:
             return
         cmd = f"sudo nmap -sS -T2 -f {quote(target)}"
-        self.executor(cmd, "Stealth scan", target=target)
+        self.executor(cmd, "Stealth scan", target=target, feature_key="discovery.nmap_full")
 
     def run_udp(self) -> None:
         target = self.validate_target()
         if not target:
             return
         cmd = f"sudo nmap -sU --top-ports 100 {quote(target)}"
-        self.executor(cmd, "UDP scan", target=target)
+        self.executor(cmd, "UDP scan", target=target, feature_key="discovery.nmap_full")
 
     def run_vuln(self) -> None:
         target = self.validate_target()
         if not target:
             return
         cmd = f"nmap --script vuln {quote(target)}"
-        self.executor(cmd, "Vuln scan", target=target)
+        self.executor(cmd, "Vuln scan", target=target, feature_key="discovery.nmap_standard")
 
     def run_service(self) -> None:
         target = self.validate_target()
         if not target:
             return
         cmd = f"nmap -sV {quote(target)}"
-        self.executor(cmd, "Service scan", target=target)
+        self.executor(cmd, "Service scan", target=target, feature_key="discovery.nmap_standard")
 
     def run_masscan(self) -> None:
         target = self.validate_target()
@@ -1044,6 +1044,19 @@ class ReconTab(CategoryTab):
             ("SNMP sweep (onesixtyone)", "onesixtyone {target}", "SNMP sweep"),
             ("SMB enum (enum4linux)", "enum4linux -a {target}", "SMB enumeration"),
         ]
+        self.discovery_feature_keys = {
+            "Ping sweep (nmap -sn)": "recon.nmap_ping",
+            "Netdiscover": "recon.netdiscover",
+            "ARP scan (arp-scan -l)": "recon.arp_scan",
+        }
+        self.enum_feature_keys = {
+            "DNS enum (dnsenum)": "recon.dnsenum",
+            "DNS recon (dnsrecon)": "recon.dnsrecon",
+            "SSL scan (sslscan)": "recon.sslscan",
+            "SSLyze (sslyze)": "recon.sslyze",
+            "SNMP sweep (onesixtyone)": "recon.onesixtyone",
+            "SMB enum (enum4linux)": "recon.enum4linux",
+        }
         self.add_panel("Target Scope", target_wrap, "Define the subnet/host to interrogate.", column_span=2)
         self.add_panel("Network Discovery", self.create_discovery_group())
         self.add_panel("Enumeration", self.create_enum_group())
@@ -1054,11 +1067,20 @@ class ReconTab(CategoryTab):
         btn_layout.setSpacing(6)
 
         for idx, (label, template, desc) in enumerate(self.discovery_options):
+            feature_key = self.discovery_feature_keys.get(label)
             button = create_glowing_button(
-                label, lambda template=template, desc=desc: self.run_discovery(template, desc)
+                label,
+                lambda template=template, desc=desc, fk=feature_key: self.run_discovery(template, desc, fk),
             )
-            required = self.main_window._infer_required_tools(template)
-            self.main_window.guard_button(button, required_tools=required, require_admin=template.strip().startswith("sudo"))
+            if feature_key:
+                self.main_window.apply_feature_support(button, feature_key)
+            else:
+                required = self.main_window._infer_required_tools(template)
+                self.main_window.guard_button(
+                    button,
+                    required_tools=required,
+                    require_admin=template.strip().startswith("sudo"),
+                )
             btn_layout.addWidget(button, idx // 2, idx % 2)
 
         group.layout().addLayout(btn_layout)
@@ -1080,11 +1102,20 @@ class ReconTab(CategoryTab):
         layout = QGridLayout()
 
         for idx, (label, template, desc) in enumerate(self.enum_options):
+            feature_key = self.enum_feature_keys.get(label)
             button = create_glowing_button(
-                label, lambda template=template, desc=desc: self.run_enum(template, desc)
+                label,
+                lambda template=template, desc=desc, fk=feature_key: self.run_enum(template, desc, fk),
             )
-            required = self.main_window._infer_required_tools(template)
-            self.main_window.guard_button(button, required_tools=required, require_admin=template.strip().startswith("sudo"))
+            if feature_key:
+                self.main_window.apply_feature_support(button, feature_key)
+            else:
+                required = self.main_window._infer_required_tools(template)
+                self.main_window.guard_button(
+                    button,
+                    required_tools=required,
+                    require_admin=template.strip().startswith("sudo"),
+                )
             layout.addWidget(button, idx // 2, idx % 2)
 
         group.layout().addLayout(layout)
@@ -1101,35 +1132,37 @@ class ReconTab(CategoryTab):
         self._update_enum_exec_state()
         return group
 
-    def run_discovery(self, template: str, description: str) -> None:
+    def run_discovery(self, template: str, description: str, feature_key: Optional[str] = None) -> None:
         target = self.target_field.value()
         if "target" in template and not target:
             QMessageBox.warning(self, "Target missing", "Provide an IP/host/CIDR.")
             return
         command = template.format(target=quote(target))
-        self.executor(command, description, target=target or "broadcast")
+        self.executor(command, description, target=target or "broadcast", feature_key=feature_key)
 
-    def run_enum(self, template: str, description: str) -> None:
+    def run_enum(self, template: str, description: str, feature_key: Optional[str] = None) -> None:
         target = self.target_field.value()
         if not target:
             QMessageBox.warning(self, "Target missing", "Provide a DNS name or host.")
             return
         command = template.format(target=quote(target))
-        self.executor(command, description, target=target)
+        self.executor(command, description, target=target, feature_key=feature_key)
 
     def run_discovery_dropdown(self) -> None:
         idx = self.discovery_combo.currentIndex()
         if idx < 0:
             return
-        _, template, desc = self.discovery_options[idx]
-        self.run_discovery(template, desc)
+        label, template, desc = self.discovery_options[idx]
+        feature_key = self.discovery_feature_keys.get(label)
+        self.run_discovery(template, desc, feature_key)
 
     def run_enum_dropdown(self) -> None:
         idx = self.enum_combo.currentIndex()
         if idx < 0:
             return
-        _, template, desc = self.enum_options[idx]
-        self.run_enum(template, desc)
+        label, template, desc = self.enum_options[idx]
+        feature_key = self.enum_feature_keys.get(label)
+        self.run_enum(template, desc, feature_key)
 
     def _update_discovery_exec_state(self) -> None:
         idx = self.discovery_combo.currentIndex()
@@ -1137,6 +1170,29 @@ class ReconTab(CategoryTab):
             self.discovery_exec_button.setEnabled(False)
             return
         _, template, _ = self.discovery_options[idx]
+        label, _, _ = self.discovery_options[idx]
+        feature_key = self.discovery_feature_keys.get(label)
+        if feature_key:
+            status = self.main_window.feature_status(feature_key)
+            allowed = bool(status.get("enabled", True))
+            reason = status.get("reason", "")
+            recommended = status.get("recommended_path", "")
+            base_support = status.get("base_support", "")
+            badge = status.get("badge", "")
+            self.main_window._register_feature_control(feature_key, self.discovery_exec_button)
+            self.main_window._apply_support_badge(self.discovery_exec_button, badge)
+            tip_parts = []
+            if reason:
+                tip_parts.append(str(reason))
+            if recommended:
+                tip_parts.append(f"Recommended path: {recommended}")
+            tooltip = " ".join(tip_parts).strip()
+            if tooltip:
+                self.discovery_exec_button.setToolTip(tooltip)
+            if base_support in ("unsupported", "external_required"):
+                allowed = False
+            self.discovery_exec_button.setEnabled(allowed)
+            return
         required = self.main_window._infer_required_tools(template)
         require_admin = template.strip().startswith("sudo")
         allowed = True
@@ -1162,6 +1218,29 @@ class ReconTab(CategoryTab):
             self.enum_exec_button.setEnabled(False)
             return
         _, template, _ = self.enum_options[idx]
+        label, _, _ = self.enum_options[idx]
+        feature_key = self.enum_feature_keys.get(label)
+        if feature_key:
+            status = self.main_window.feature_status(feature_key)
+            allowed = bool(status.get("enabled", True))
+            reason = status.get("reason", "")
+            recommended = status.get("recommended_path", "")
+            base_support = status.get("base_support", "")
+            badge = status.get("badge", "")
+            self.main_window._register_feature_control(feature_key, self.enum_exec_button)
+            self.main_window._apply_support_badge(self.enum_exec_button, badge)
+            tip_parts = []
+            if reason:
+                tip_parts.append(str(reason))
+            if recommended:
+                tip_parts.append(f"Recommended path: {recommended}")
+            tooltip = " ".join(tip_parts).strip()
+            if tooltip:
+                self.enum_exec_button.setToolTip(tooltip)
+            if base_support in ("unsupported", "external_required"):
+                allowed = False
+            self.enum_exec_button.setEnabled(allowed)
+            return
         required = self.main_window._infer_required_tools(template)
         require_admin = template.strip().startswith("sudo")
         allowed = True
@@ -1206,6 +1285,11 @@ class WirelessTab(CategoryTab):
         self.attack_combo.addItems(
             ["Deauth attack", "WPS attack (reaver)", "Handshake capture"]
         )
+        self.attack_feature_keys = {
+            "Deauth attack": "wireless.packet_injection",
+            "WPS attack (reaver)": "wireless.wps_attack",
+            "Handshake capture": "wireless.handshake_capture",
+        }
         channel_layout = QHBoxLayout()
         channel_layout.addWidget(QLabel("Channel"))
         channel_layout.addWidget(self.channel_input)
@@ -1230,8 +1314,8 @@ class WirelessTab(CategoryTab):
         enable_btn = create_glowing_button("Enable monitor mode", self.enable_monitor)
         disable_btn = create_glowing_button("Disable monitor mode", self.disable_monitor)
         refresh_btn = create_glowing_button("Refresh interfaces", self.refresh_interfaces)
-        self.main_window.guard_button(enable_btn, required_tools=["airmon-ng"], require_admin=True)
-        self.main_window.guard_button(disable_btn, required_tools=["airmon-ng"], require_admin=True)
+        self.main_window.apply_feature_support(enable_btn, "wireless.monitor_mode")
+        self.main_window.apply_feature_support(disable_btn, "wireless.monitor_mode")
         self.main_window.guard_button(refresh_btn, feature_flag="can_list_interfaces")
         layout.addWidget(enable_btn, 0, 0)
         layout.addWidget(disable_btn, 0, 1)
@@ -1247,9 +1331,9 @@ class WirelessTab(CategoryTab):
         airodump = create_glowing_button("Run airodump-ng (10s)", self.run_airodump)
         bettercap = create_glowing_button("Bettercap capture", self.run_bettercap)
         wifite = create_glowing_button("Start wifite (auto)", self.run_wifite)
-        self.main_window.guard_button(airodump, required_tools=["airodump-ng"], require_admin=True)
-        self.main_window.guard_button(bettercap, required_tools=["bettercap"], require_admin=True)
-        self.main_window.guard_button(wifite, required_tools=["wifite"], require_admin=True)
+        self.main_window.apply_feature_support(airodump, "wireless.airodump")
+        self.main_window.apply_feature_support(bettercap, "wireless.bettercap")
+        self.main_window.apply_feature_support(wifite, "wireless.wifite")
         layout.addWidget(airodump, 0, 0)
         layout.addWidget(bettercap, 0, 1)
         layout.addWidget(wifite, 1, 0, 1, 2)
@@ -1264,9 +1348,9 @@ class WirelessTab(CategoryTab):
         deauth_btn = create_glowing_button("Deauth attack", self.deauth_attack)
         wps_btn = create_glowing_button("WPS attack (reaver)", self.wps_attack)
         handshake_btn = create_glowing_button("Capture handshake", self.capture_handshake)
-        self.main_window.guard_button(deauth_btn, required_tools=["aireplay-ng"], require_admin=True)
-        self.main_window.guard_button(wps_btn, required_tools=["reaver"], require_admin=True)
-        self.main_window.guard_button(handshake_btn, required_tools=["airodump-ng"], require_admin=True)
+        self.main_window.apply_feature_support(deauth_btn, "wireless.packet_injection")
+        self.main_window.apply_feature_support(wps_btn, "wireless.wps_attack")
+        self.main_window.apply_feature_support(handshake_btn, "wireless.handshake_capture")
         layout.addWidget(deauth_btn, 0, 0)
         layout.addWidget(wps_btn, 0, 1)
         layout.addWidget(handshake_btn, 1, 0, 1, 2)
@@ -1290,9 +1374,9 @@ class WirelessTab(CategoryTab):
         aircrack_btn = create_glowing_button("Crack with aircrack-ng", self.run_aircrack)
         hashcat_btn = create_glowing_button("Crack with hashcat", self.run_hashcat)
         convert_btn = create_glowing_button("Convert .cap -> .hc22000", self.convert_handshake)
-        self.main_window.guard_button(aircrack_btn, required_tools=["aircrack-ng"])
-        self.main_window.guard_button(hashcat_btn, required_tools=["hashcat"])
-        self.main_window.guard_button(convert_btn, required_tools=["hcxpcapngtool"])
+        self.main_window.apply_feature_support(aircrack_btn, "wireless.aircrack")
+        self.main_window.apply_feature_support(hashcat_btn, "wireless.hashcat")
+        self.main_window.apply_feature_support(convert_btn, "wireless.convert_handshake")
         layout.addWidget(aircrack_btn, 0, 0)
         layout.addWidget(hashcat_btn, 0, 1)
         layout.addWidget(convert_btn, 1, 0, 1, 2)
@@ -1385,35 +1469,35 @@ class WirelessTab(CategoryTab):
         if not iface:
             return
         cmd = f"sudo airmon-ng start {quote(iface)}"
-        self.executor(cmd, "Enable monitor mode", target=iface)
+        self.executor(cmd, "Enable monitor mode", target=iface, feature_key="wireless.monitor_mode")
 
     def disable_monitor(self) -> None:
         iface = self.iface()
         if not iface:
             return
         cmd = f"sudo airmon-ng stop {quote(iface)}"
-        self.executor(cmd, "Disable monitor", target=iface)
+        self.executor(cmd, "Disable monitor", target=iface, feature_key="wireless.monitor_mode")
 
     def run_airodump(self) -> None:
         iface = self.iface()
         if not iface:
             return
         cmd = f"sudo timeout 15 airodump-ng {quote(iface)}"
-        self.executor(cmd, "airodump-ng scan", target=iface)
+        self.executor(cmd, "airodump-ng scan", target=iface, feature_key="wireless.airodump")
 
     def run_bettercap(self) -> None:
         iface = self.iface()
         if not iface:
             return
         cmd = f"sudo bettercap -iface {quote(iface)} -eval 'set arp.spoof.fullduplex true; net.sniff on'"
-        self.executor(cmd, "Bettercap session", target=iface)
+        self.executor(cmd, "Bettercap session", target=iface, feature_key="wireless.bettercap")
 
     def run_wifite(self) -> None:
         iface = self.iface()
         if not iface:
             return
         cmd = f"sudo wifite -i {quote(iface)} --kill"
-        self.executor(cmd, "Wifite attack", target=iface)
+        self.executor(cmd, "Wifite attack", target=iface, feature_key="wireless.wifite")
 
     def deauth_attack(self) -> None:
         iface = self.iface()
@@ -1427,7 +1511,7 @@ class WirelessTab(CategoryTab):
         if self.main_window and self.bssid_field.value():
             self.main_window.add_bssid_history(self.bssid_field.value())
         cmd = f"sudo aireplay-ng --deauth 10 -a {quote(target)} {quote(iface)}"
-        self.executor(cmd, "Deauth", target=iface)
+        self.executor(cmd, "Deauth", target=iface, feature_key="wireless.packet_injection")
 
     def wps_attack(self) -> None:
         iface = self.iface()
@@ -1446,7 +1530,7 @@ class WirelessTab(CategoryTab):
         channel = self.channel_input.text().strip()
         channel_arg = f"-c {quote(channel)}" if channel else ""
         cmd = f"sudo reaver -i {quote(iface)} -b {quote(target)} {channel_arg} -N -vv"
-        self.executor(cmd, "WPS attack (reaver)", target=target)
+        self.executor(cmd, "WPS attack (reaver)", target=target, feature_key="wireless.wps_attack")
 
     def capture_handshake(self) -> None:
         iface = self.iface()
@@ -1465,7 +1549,7 @@ class WirelessTab(CategoryTab):
         channel = self.channel_input.text().strip()
         channel_arg = f"-c {quote(channel)}" if channel else ""
         cmd = f"sudo timeout 20 airodump-ng --bssid {quote(target)} {channel_arg} -w /tmp/handshake {quote(iface)}"
-        self.executor(cmd, "Handshake capture", target=target)
+        self.executor(cmd, "Handshake capture", target=target, feature_key="wireless.handshake_capture")
 
     def run_aircrack(self) -> None:
         capfile, ok = self.request_input("Capture file (.cap)", "/tmp/capture.cap")
@@ -1473,7 +1557,7 @@ class WirelessTab(CategoryTab):
             return
         wordlist, _ = self.request_input("Wordlist", "/usr/share/wordlists/rockyou.txt")
         cmd = f"aircrack-ng -w {quote(wordlist)} {quote(capfile)}"
-        self.executor(cmd, "Aircrack-ng", target=capfile)
+        self.executor(cmd, "Aircrack-ng", target=capfile, feature_key="wireless.aircrack")
 
     def run_hashcat(self) -> None:
         hashfile, ok = self.request_input("Hash/Capture file", "/tmp/hash.hc22000")
@@ -1481,14 +1565,14 @@ class WirelessTab(CategoryTab):
             return
         wordlist, _ = self.request_input("Wordlist", "/usr/share/wordlists/rockyou.txt")
         cmd = f"hashcat -m 22000 -a 0 {quote(hashfile)} {quote(wordlist)} --status --potfile-path /tmp/hashcat.pot"
-        self.executor(cmd, "Hashcat", target=hashfile)
+        self.executor(cmd, "Hashcat", target=hashfile, feature_key="wireless.hashcat")
 
     def convert_handshake(self) -> None:
         capfile, ok = self.request_input("Capture file (.cap)", "/tmp/handshake.cap")
         if not ok or not capfile:
             return
         cmd = f"hcxpcapngtool -o {quote(capfile)}.hc22000 {quote(capfile)}"
-        self.executor(cmd, "Convert handshake", target=capfile)
+        self.executor(cmd, "Convert handshake", target=capfile, feature_key="wireless.convert_handshake")
 
     def run_selected_wireless_attack(self) -> None:
         choice = self.attack_combo.currentText()
@@ -1501,24 +1585,29 @@ class WirelessTab(CategoryTab):
 
     def _update_attack_exec_state(self) -> None:
         choice = self.attack_combo.currentText()
-        tool = ""
-        if choice == "Deauth attack":
-            tool = "aireplay-ng"
-        elif choice == "WPS attack (reaver)":
-            tool = "reaver"
-        elif choice == "Handshake capture":
-            tool = "airodump-ng"
-        allowed = True
-        reason = ""
-        if tool and not (self.main_window.capabilities.tools.get(tool, False) or shutil.which(tool)):
-            allowed = False
-            reason = f"Missing tool: {tool}"
-        if not self.main_window.capabilities.is_admin:
-            allowed = False
-            reason = "Requires administrator/root privileges"
-        self.attack_exec_button.setEnabled(allowed)
-        if not allowed:
-            self.attack_exec_button.setToolTip(reason)
+        feature_key = self.attack_feature_keys.get(choice)
+        if feature_key:
+            status = self.main_window.feature_status(feature_key)
+            allowed = bool(status.get("enabled", True))
+            reason = status.get("reason", "")
+            recommended = status.get("recommended_path", "")
+            base_support = status.get("base_support", "")
+            badge = status.get("badge", "")
+            self.main_window._register_feature_control(feature_key, self.attack_exec_button)
+            self.main_window._apply_support_badge(self.attack_exec_button, badge)
+            tip_parts = []
+            if reason:
+                tip_parts.append(str(reason))
+            if recommended:
+                tip_parts.append(f"Recommended path: {recommended}")
+            tooltip = " ".join(tip_parts).strip()
+            if tooltip:
+                self.attack_exec_button.setToolTip(tooltip)
+            if base_support in ("unsupported", "external_required"):
+                allowed = False
+            self.attack_exec_button.setEnabled(allowed)
+            return
+        self.attack_exec_button.setEnabled(True)
 
     def request_input(self, prompt: str, default: str = "") -> Tuple[str, bool]:
         value, ok = QInputDialog.getText(self, "Input required", prompt, text=default)
@@ -1550,6 +1639,18 @@ class WebTab(CategoryTab):
             ("Dirb", "dirb {target} /usr/share/wordlists/raft.txt"),
             ("Feroxbuster", "feroxbuster -u {target} -w /usr/share/wordlists/raft.txt"),
         ]
+        self.web_feature_keys = {
+            "SQLmap": "web.sqlmap",
+            "Nikto": "web.nikto",
+            "Nuclei": "web.nuclei",
+            "XSStrike": "web.xsstrike",
+            "Commix": "web.commix",
+        }
+        self.dir_feature_keys = {
+            "Gobuster": "web.gobuster",
+            "Dirb": "web.dirb",
+            "Feroxbuster": "web.feroxbuster",
+        }
         self.add_panel("Target URL / Domain", target_wrap, "Scope for scanners and brute-force", column_span=2)
         self.add_panel("Scanners & Injection", self.build_web_tools_group())
         self.add_panel("Directory Brute-force", self.build_directory_group())
@@ -1559,9 +1660,16 @@ class WebTab(CategoryTab):
         layout = QGridLayout()
 
         for idx, (label, template, desc) in enumerate(self.web_scanners):
-            button = create_glowing_button(label, lambda t=template, d=desc: self.run_web_tool(t, d))
-            required = self.main_window._infer_required_tools(template)
-            self.main_window.guard_button(button, required_tools=required)
+            feature_key = self.web_feature_keys.get(label)
+            button = create_glowing_button(
+                label,
+                lambda t=template, d=desc, fk=feature_key: self.run_web_tool(t, d, fk),
+            )
+            if feature_key:
+                self.main_window.apply_feature_support(button, feature_key)
+            else:
+                required = self.main_window._infer_required_tools(template)
+                self.main_window.guard_button(button, required_tools=required)
             layout.addWidget(button, idx // 2, idx % 2)
 
         group.layout().addLayout(layout)
@@ -1584,9 +1692,16 @@ class WebTab(CategoryTab):
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(6)
         for idx, (label, template) in enumerate(self.dir_tools):
-            button = create_glowing_button(label, lambda t=template: self.run_dir_tool(t))
-            required = self.main_window._infer_required_tools(template)
-            self.main_window.guard_button(button, required_tools=required)
+            feature_key = self.dir_feature_keys.get(label)
+            button = create_glowing_button(
+                label,
+                lambda t=template, fk=feature_key: self.run_dir_tool(t, fk),
+            )
+            if feature_key:
+                self.main_window.apply_feature_support(button, feature_key)
+            else:
+                required = self.main_window._infer_required_tools(template)
+                self.main_window.guard_button(button, required_tools=required)
             layout.addWidget(button, idx // 2, idx % 2)
         group.layout().addLayout(layout)
         drop_layout = QHBoxLayout()
@@ -1602,42 +1717,66 @@ class WebTab(CategoryTab):
         self._update_dir_exec_state()
         return group
 
-    def run_web_tool(self, template: str, description: str) -> None:
+    def run_web_tool(self, template: str, description: str, feature_key: Optional[str] = None) -> None:
         target = self.target_field.value()
         if not target:
             QMessageBox.warning(self, "Target missing", "Provide a URL before running.")
             return
         command = template.format(target=quote(target))
-        self.executor(command, description, target=target)
+        self.executor(command, description, target=target, feature_key=feature_key)
 
-    def run_dir_tool(self, template: str) -> None:
+    def run_dir_tool(self, template: str, feature_key: Optional[str] = None) -> None:
         target = self.target_field.value()
         if not target:
             QMessageBox.warning(self, "Target missing", "Provide a target URL.")
             return
         command = template.format(target=quote(target))
-        self.executor(command, "Directory bruteforce", target=target)
+        self.executor(command, "Directory bruteforce", target=target, feature_key=feature_key)
 
     def run_web_combo(self) -> None:
         idx = self.web_combo.currentIndex()
         if idx < 0:
             return
-        _, template, desc = self.web_scanners[idx]
-        self.run_web_tool(template, desc)
+        label, template, desc = self.web_scanners[idx]
+        feature_key = self.web_feature_keys.get(label)
+        self.run_web_tool(template, desc, feature_key)
 
     def run_dir_combo(self) -> None:
         idx = self.dir_combo.currentIndex()
         if idx < 0:
             return
-        _, template = self.dir_tools[idx]
-        self.run_dir_tool(template)
+        label, template = self.dir_tools[idx]
+        feature_key = self.dir_feature_keys.get(label)
+        self.run_dir_tool(template, feature_key)
 
     def _update_web_exec_state(self) -> None:
         idx = self.web_combo.currentIndex()
         if idx < 0:
             self.web_exec_button.setEnabled(False)
             return
-        _, template, _ = self.web_scanners[idx]
+        label, template, _ = self.web_scanners[idx]
+        feature_key = self.web_feature_keys.get(label)
+        if feature_key:
+            status = self.main_window.feature_status(feature_key)
+            allowed = bool(status.get("enabled", True))
+            reason = status.get("reason", "")
+            recommended = status.get("recommended_path", "")
+            base_support = status.get("base_support", "")
+            badge = status.get("badge", "")
+            self.main_window._register_feature_control(feature_key, self.web_exec_button)
+            self.main_window._apply_support_badge(self.web_exec_button, badge)
+            tip_parts = []
+            if reason:
+                tip_parts.append(str(reason))
+            if recommended:
+                tip_parts.append(f"Recommended path: {recommended}")
+            tooltip = " ".join(tip_parts).strip()
+            if tooltip:
+                self.web_exec_button.setToolTip(tooltip)
+            if base_support in ("unsupported", "external_required"):
+                allowed = False
+            self.web_exec_button.setEnabled(allowed)
+            return
         required = self.main_window._infer_required_tools(template)
         allowed = True
         reason = ""
@@ -1658,7 +1797,29 @@ class WebTab(CategoryTab):
         if idx < 0:
             self.dir_exec_button.setEnabled(False)
             return
-        _, template = self.dir_tools[idx]
+        label, template = self.dir_tools[idx]
+        feature_key = self.dir_feature_keys.get(label)
+        if feature_key:
+            status = self.main_window.feature_status(feature_key)
+            allowed = bool(status.get("enabled", True))
+            reason = status.get("reason", "")
+            recommended = status.get("recommended_path", "")
+            base_support = status.get("base_support", "")
+            badge = status.get("badge", "")
+            self.main_window._register_feature_control(feature_key, self.dir_exec_button)
+            self.main_window._apply_support_badge(self.dir_exec_button, badge)
+            tip_parts = []
+            if reason:
+                tip_parts.append(str(reason))
+            if recommended:
+                tip_parts.append(f"Recommended path: {recommended}")
+            tooltip = " ".join(tip_parts).strip()
+            if tooltip:
+                self.dir_exec_button.setToolTip(tooltip)
+            if base_support in ("unsupported", "external_required"):
+                allowed = False
+            self.dir_exec_button.setEnabled(allowed)
+            return
         required = self.main_window._infer_required_tools(template)
         allowed = True
         reason = ""
@@ -1763,6 +1924,7 @@ class NetReaperGui(QWidget):
         self.target_history: List[str] = []
         self.bssid_fields: List[TargetField] = []
         self.bssid_history: List[str] = []
+        self.feature_controls: Dict[str, List[QPushButton]] = {}
         self.active_jobs: set[str] = set()
         self.wiring_flags = {}
         self.lite_mode = False
@@ -1791,7 +1953,7 @@ class NetReaperGui(QWidget):
         self.toolbar.addAction(clear_log_action)
         self.toolbar.addSeparator()
         refresh_status_action = QAction("Show status", self)
-        refresh_status_action.triggered.connect(lambda: self.execute_command("netreaper status", "Status"))
+        refresh_status_action.triggered.connect(lambda: self.submit_command_job("netreaper status", "Status"))
         if not (shutil.which("netreaper") or self.capabilities.tools.get("netreaper", False)):
             refresh_status_action.setEnabled(False)
             refresh_status_action.setToolTip("Missing tool: netreaper")
@@ -1851,12 +2013,12 @@ class NetReaperGui(QWidget):
         central_splitter.setStretchFactor(1, 1)
         main_layout.addWidget(central_splitter, stretch=1)
 
-        self.scan_tab = ScanTab(self.execute_command, self)
-        self.recon_tab = ReconTab(self.execute_command, self)
-        self.wireless_tab = WirelessTab(self.execute_command, self)
-        self.web_tab = WebTab(self.execute_command, self)
-        self.tools_tab = ToolsTab(self.execute_command, self)
-        self.wizard_tab = WizardTab(self.execute_command, self)
+        self.scan_tab = ScanTab(self.submit_command_job, self)
+        self.recon_tab = ReconTab(self.submit_command_job, self)
+        self.wireless_tab = WirelessTab(self.submit_command_job, self)
+        self.web_tab = WebTab(self.submit_command_job, self)
+        self.tools_tab = ToolsTab(self.submit_command_job, self)
+        self.wizard_tab = WizardTab(self.submit_command_job, self)
         self.jobs_tab = JobsTab(self.job_manager, self.save_diagnostics, self.run_self_test, self)
 
         wizard_page = self._wrap_in_workspace("Automation Wizards", self.wizard_tab)
@@ -2063,6 +2225,51 @@ class NetReaperGui(QWidget):
             self.output_panel.set_status(color)
         if hasattr(self, "history_panel"):
             self.history_panel.set_status(color)
+
+    def feature_status(self, feature_key: str) -> Dict[str, object]:
+        return self.capabilities.feature_support.get(feature_key, {})
+
+    def _register_feature_control(self, feature_key: str, button: QPushButton) -> None:
+        if not hasattr(self, "feature_controls"):
+            self.feature_controls = {}
+        controls = self.feature_controls.setdefault(feature_key, [])
+        if button not in controls:
+            controls.append(button)
+
+    def _apply_support_badge(self, button: QPushButton, badge: str) -> None:
+        base_text = button.property("baseText")
+        if not base_text:
+            base_text = button.text()
+            button.setProperty("baseText", base_text)
+        if badge:
+            button.setText(f"{base_text} [{badge}]")
+        else:
+            button.setText(base_text)
+
+    def apply_feature_support(self, button: QPushButton, feature_key: str) -> None:
+        status = self.feature_status(feature_key)
+        if not status:
+            return
+        self._register_feature_control(feature_key, button)
+        badge = status.get("badge", "")
+        self._apply_support_badge(button, badge)
+        parts: List[str] = []
+        reason = str(status.get("reason", "")).strip()
+        notes = str(status.get("notes", "")).strip()
+        recommended = str(status.get("recommended_path", "")).strip()
+        if reason:
+            parts.append(reason)
+        if notes:
+            parts.append(notes)
+        if recommended:
+            parts.append(f"Recommended path: {recommended}")
+        tooltip = " ".join(parts).strip()
+        if tooltip:
+            button.setToolTip(tooltip)
+        base_support = status.get("base_support", "")
+        enabled = bool(status.get("enabled", True))
+        if not enabled or base_support in ("unsupported", "external_required"):
+            button.setEnabled(False)
 
     def guard_button(
         self,
@@ -2283,6 +2490,12 @@ class NetReaperGui(QWidget):
 
         def parse(result: ExecutionResult) -> Dict[str, Any]:
             payload = result.payload or {}
+            negative = payload.get("negative", {})
+            negative_errors = (
+                len(negative.get("ui_errors", []))
+                + len(negative.get("probe_errors", []))
+                + (1 if negative.get("missing_tool_check", {}).get("status") == "fail" else 0)
+            )
             summary = {
                 "interfaces": len(payload.get("interfaces", [])),
                 "routes": len(payload.get("routes", [])),
@@ -2291,6 +2504,8 @@ class NetReaperGui(QWidget):
                 "wifi": len(payload.get("aps", [])),
                 "hosts": len(payload.get("hosts", [])),
                 "errors": len(payload.get("errors", [])),
+                "disabled_features": len(negative.get("disabled_features", [])),
+                "negative_errors": negative_errors,
             }
             return {
                 **payload,
@@ -2408,6 +2623,8 @@ class NetReaperGui(QWidget):
             "is_admin": self.capabilities.is_admin,
             "tools": self.capabilities.tools,
             "features": self.capabilities.feature_flags,
+            "feature_matrix": self.capabilities.feature_matrix,
+            "feature_support": self.capabilities.feature_support,
             "job_history": self.job_manager.job_history,
         }
         try:
@@ -2416,12 +2633,161 @@ class NetReaperGui(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Diagnostics failed", f"Failed to save diagnostics: {exc}")
 
+    def _run_blocked_feature_probes(self, feature_keys: List[str], timeout_s: float = 4.0) -> List[Dict[str, Any]]:
+        if not feature_keys:
+            return []
+        job_feature_map: Dict[str, str] = {}
+        pending: List[str] = []
+        events: Dict[str, List[Dict[str, Any]]] = {}
+        results: List[Dict[str, Any]] = []
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setSingleShot(True)
+
+        def on_event(event: Dict[str, Any]) -> None:
+            job_id = event.get("job_id")
+            if job_id in pending:
+                events[job_id].append(event)
+
+        def on_result(result: Dict[str, Any]) -> None:
+            job_id = result.get("job_id")
+            if job_id in pending:
+                pending.remove(job_id)
+            if not pending:
+                loop.quit()
+
+        self.job_manager.event_emitted.connect(on_event)
+        self.job_manager.result_emitted.connect(on_result)
+
+        for feature_key in feature_keys:
+            status = self.feature_status(feature_key)
+            reason = str(status.get("reason", "Feature unavailable"))
+            guidance = str(status.get("recommended_path", ""))
+
+            def precheck(reason=reason, guidance=guidance) -> tuple[bool, str, str]:
+                return False, reason, guidance
+
+            def execute() -> ExecutionResult:
+                return ExecutionResult(returncode=1, error="Probe executed unexpectedly")
+
+            def parse(_result: ExecutionResult) -> Dict[str, Any]:
+                return {"summary": {"probe": True}, "counts": {}, "items": []}
+
+            def ui_update(_payload: Dict[str, Any]) -> None:
+                return
+
+            job = JobSpec(
+                name=f"Self-test probe: {feature_key}",
+                category="diagnostics",
+                precheck=precheck,
+                execute=execute,
+                parse=parse,
+                ui_update=ui_update,
+                feature_key=feature_key,
+            )
+            job_feature_map[job.job_id] = feature_key
+            pending.append(job.job_id)
+            events[job.job_id] = []
+            self.job_manager.run_job(job)
+
+        timer.timeout.connect(loop.quit)
+        QApplication.processEvents()
+        if pending:
+            timer.start(int(timeout_s * 1000))
+            loop.exec()
+            timer.stop()
+
+        self.job_manager.event_emitted.disconnect(on_event)
+        self.job_manager.result_emitted.disconnect(on_result)
+
+        for job_id in job_feature_map:
+            events.setdefault(job_id, [])
+
+        for job_id, event_list in events.items():
+            feature_key = job_feature_map.get(job_id, "")
+            event_types = [event.get("type", "") for event in event_list]
+            blocked_event = next((event for event in event_list if event.get("type") == "BLOCKED_BY_CAPABILITY"), None)
+            blocked_detail = blocked_event.get("detail", {}) if blocked_event else {}
+            results.append(
+                {
+                    "feature_key": feature_key,
+                    "job_id": job_id,
+                    "event_types": event_types,
+                    "blocked_event": bool(blocked_event),
+                    "blocked_reason": blocked_detail.get("reason", ""),
+                    "blocked_guidance": blocked_detail.get("guidance", ""),
+                    "exec_started": "EXEC_START" in event_types,
+                    "timed_out": job_id in pending,
+                }
+            )
+        return results
+
     def run_self_test(self) -> None:
         """Run provider self-tests and update discovery views."""
         scan_tab = getattr(self, "scan_tab", None)
         if scan_tab is None or not hasattr(scan_tab, "update_discovery"):
             QMessageBox.warning(self, "Self test unavailable", "Scan tab is not ready for diagnostics.")
             return
+
+        disabled_features = {
+            key: status
+            for key, status in self.capabilities.feature_support.items()
+            if not status.get("enabled", True)
+        }
+        ui_checks: List[Dict[str, Any]] = []
+        ui_errors: List[str] = []
+        missing_tool_hits: List[str] = []
+        missing_tool_errors: List[str] = []
+        for feature_key, controls in getattr(self, "feature_controls", {}).items():
+            status = disabled_features.get(feature_key)
+            if not status:
+                continue
+            reason = str(status.get("reason", "")).strip()
+            recommended = str(status.get("recommended_path", "")).strip()
+            badge = str(status.get("badge", "")).strip()
+            for control in controls:
+                tooltip = control.toolTip() or ""
+                text = control.text()
+                enabled = control.isEnabled()
+                ui_checks.append(
+                    {
+                        "feature_key": feature_key,
+                        "control_text": text,
+                        "enabled": enabled,
+                        "tooltip": tooltip,
+                    }
+                )
+                if enabled:
+                    ui_errors.append(f"{feature_key} control still enabled: {text}")
+                if reason and reason not in tooltip:
+                    ui_errors.append(f"{feature_key} tooltip missing reason: {text}")
+                if recommended and recommended not in tooltip:
+                    ui_errors.append(f"{feature_key} tooltip missing recommendation: {text}")
+                if badge and badge not in text:
+                    ui_errors.append(f"{feature_key} badge missing: {text}")
+                if "Missing tool" in reason:
+                    if "Missing tool" in tooltip:
+                        missing_tool_hits.append(feature_key)
+                    else:
+                        missing_tool_errors.append(f"{feature_key} tooltip missing missing-tool reason.")
+
+        if missing_tool_errors:
+            missing_tool_check = {"status": "fail", "detail": "; ".join(missing_tool_errors)}
+        elif missing_tool_hits:
+            missing_tool_check = {"status": "pass", "detail": "Missing-tool messaging present."}
+        else:
+            missing_tool_check = {"status": "skipped", "detail": "No missing-tool features detected."}
+
+        probe_features = [key for key in disabled_features.keys() if key in getattr(self, "feature_controls", {})]
+        probe_results = self._run_blocked_feature_probes(probe_features)
+        probe_errors = []
+        for probe in probe_results:
+            if not probe.get("blocked_event"):
+                probe_errors.append(f"{probe.get('feature_key')} missing BLOCKED_BY_CAPABILITY event")
+            if probe.get("exec_started"):
+                probe_errors.append(f"{probe.get('feature_key')} executed despite being blocked")
+            if probe.get("timed_out"):
+                probe_errors.append(f"{probe.get('feature_key')} probe timed out")
 
         def execute() -> ExecutionResult:
             start = time.time()
@@ -2434,6 +2800,14 @@ class NetReaperGui(QWidget):
                 "aps": [],
                 "hosts": [],
                 "errors": [],
+                "negative": {
+                    "disabled_features": list(disabled_features.keys()),
+                    "ui_checks": ui_checks,
+                    "ui_errors": ui_errors,
+                    "probe_results": probe_results,
+                    "probe_errors": probe_errors,
+                    "missing_tool_check": missing_tool_check,
+                },
             }
 
             tests = [
@@ -2456,6 +2830,13 @@ class NetReaperGui(QWidget):
                                 errors.append(f"{key}[{idx}] missing field: {field}")
                 except Exception as exc:
                     errors.append(f"{key} test failed: {exc}")
+
+            if ui_errors:
+                errors.extend(ui_errors)
+            if probe_errors:
+                errors.extend(probe_errors)
+            if missing_tool_check.get("status") == "fail":
+                errors.append(missing_tool_check.get("detail", "Missing-tool check failed"))
 
             payload["errors"] = errors
             return ExecutionResult(returncode=0 if not errors else 1, payload=payload, elapsed=time.time() - start)
@@ -2490,8 +2871,81 @@ class NetReaperGui(QWidget):
         )
         self.job_manager.run_job(job)
 
-    def execute_command(self, command: str, description: str, target: Optional[str] = None, *, use_powershell: Optional[bool] = None, is_linux_command: bool = False, timeout: int = 120) -> Optional[str]:
-        """Execute a command via the unified job pipeline."""
+    def _run_command_subprocess(
+        self,
+        command: str,
+        job_id: str,
+        *,
+        use_powershell: bool,
+        is_linux_command: bool,
+        timeout: int,
+        requires_admin: bool,
+    ) -> ExecutionResult:
+        start = time.time()
+        run_command = command
+        if requires_admin and self.capabilities.is_admin and not shutil.which("sudo"):
+            if run_command.startswith("sudo"):
+                run_command = run_command[len("sudo"):].strip()
+
+        env = os.environ.copy()
+        if self.lite_mode:
+            env["NR_LITE_MODE"] = "1"
+        if self.custom_wordlist:
+            env["DEFAULT_WORDLIST"] = self.custom_wordlist
+
+        if is_linux_command:
+            cmd_list = ["wsl", "-e"] + shlex.split(run_command)
+        elif use_powershell:
+            cmd_list = ["powershell", "-NoProfile", "-Command", run_command]
+        else:
+            cmd_list = shlex.split(run_command)
+
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        process = subprocess.Popen(
+            cmd_list,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            creationflags=creationflags,
+        )
+        self._active_processes[job_id] = process
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            returncode = 1
+            return ExecutionResult(
+                returncode=returncode,
+                stdout=stdout.splitlines(),
+                stderr=stderr.splitlines(),
+                error="Command timed out",
+                elapsed=time.time() - start,
+            )
+        finally:
+            self._active_processes.pop(job_id, None)
+
+        return ExecutionResult(
+            returncode=returncode,
+            stdout=stdout.splitlines(),
+            stderr=stderr.splitlines(),
+            elapsed=time.time() - start,
+        )
+
+    def submit_command_job(
+        self,
+        command: str,
+        description: str,
+        target: Optional[str] = None,
+        *,
+        use_powershell: Optional[bool] = None,
+        is_linux_command: bool = False,
+        timeout: int = 120,
+        feature_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Submit a command as a JobSpec so lifecycle events are consistent."""
         command = command.strip()
         if not command:
             QMessageBox.warning(self, "Empty command", "No command provided")
@@ -2505,6 +2959,12 @@ class NetReaperGui(QWidget):
                 is_linux_command = True
 
         def precheck() -> tuple[bool, str, str]:
+            if feature_key:
+                status = self.feature_status(feature_key)
+                if status and not status.get("enabled", True):
+                    reason = status.get("reason", "Feature unavailable")
+                    guidance = status.get("recommended_path", "")
+                    return False, reason, guidance
             if is_linux_command and not self.capabilities.tools.get("wsl", False):
                 return False, "WSL not available", "Install WSL to run Linux commands."
             if requires_admin and not self.capabilities.is_admin:
@@ -2520,57 +2980,13 @@ class NetReaperGui(QWidget):
             return True, "", ""
 
         def execute() -> ExecutionResult:
-            start = time.time()
-            run_command = command
-            if requires_admin and self.capabilities.is_admin and not shutil.which("sudo"):
-                if run_command.startswith("sudo"):
-                    run_command = run_command[len("sudo"):].strip()
-
-            env = os.environ.copy()
-            if self.lite_mode:
-                env["NR_LITE_MODE"] = "1"
-            if self.custom_wordlist:
-                env["DEFAULT_WORDLIST"] = self.custom_wordlist
-
-            if is_linux_command:
-                cmd_list = ["wsl", "-e"] + shlex.split(run_command)
-            elif use_powershell:
-                cmd_list = ["powershell", "-NoProfile", "-Command", run_command]
-            else:
-                cmd_list = shlex.split(run_command)
-
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-            process = subprocess.Popen(
-                cmd_list,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                creationflags=creationflags,
-            )
-            self._active_processes[job_id] = process
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-                returncode = process.returncode
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-                returncode = 1
-                return ExecutionResult(
-                    returncode=returncode,
-                    stdout=stdout.splitlines(),
-                    stderr=stderr.splitlines(),
-                    error="Command timed out",
-                    elapsed=time.time() - start,
-                )
-            finally:
-                self._active_processes.pop(job_id, None)
-
-            return ExecutionResult(
-                returncode=returncode,
-                stdout=stdout.splitlines(),
-                stderr=stderr.splitlines(),
-                elapsed=time.time() - start,
+            return self._run_command_subprocess(
+                command,
+                job_id,
+                use_powershell=use_powershell,
+                is_linux_command=is_linux_command,
+                timeout=timeout,
+                requires_admin=requires_admin,
             )
 
         def parse(result: ExecutionResult) -> Dict[str, Any]:
@@ -2613,6 +3029,7 @@ class NetReaperGui(QWidget):
             parse=parse,
             ui_update=ui_update,
             job_id=job_id,
+            feature_key=feature_key,
         )
         self.job_manager.run_job(job)
         return job_id
@@ -2671,7 +3088,7 @@ class NetReaperGui(QWidget):
     def replay_command(self, item: QListWidgetItem) -> None:
         command = item.data(Qt.ItemDataRole.UserRole)
         if command:
-            self.execute_command(command, "Re-run")
+            self.submit_command_job(command, "Re-run")
 
     def refresh_reaper_header(self) -> None:
         target = ""
@@ -2695,7 +3112,7 @@ class NetReaperGui(QWidget):
         cmd = self.cmd_input.text().strip()
         if cmd:
             self.output_log.appendPlainText(f"> {cmd}")
-            self.execute_command(cmd, "Manual Command")
+            self.submit_command_job(cmd, "Manual Command")
             self.cmd_input.clear()
 
     def stop_all_tasks(self) -> None:

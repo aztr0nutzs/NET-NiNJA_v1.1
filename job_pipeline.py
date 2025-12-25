@@ -29,6 +29,7 @@ class JobSpec:
     ui_update: Callable[[Dict[str, Any]], None]
     precheck: Optional[Callable[[], tuple[bool, str, str]]] = None
     job_id: str = field(default_factory=lambda: uuid4().hex[:8].upper())
+    feature_key: Optional[str] = None
 
 
 class DiagnosticsLog:
@@ -82,6 +83,7 @@ class JobWorker(QRunnable):
             "job_id": self.job.job_id,
             "name": self.job.name,
             "category": self.job.category,
+            "feature_key": self.job.feature_key,
             "detail": detail,
         }
         self.signals.event.emit(payload)
@@ -92,12 +94,19 @@ class JobWorker(QRunnable):
         if self.job.precheck:
             ok, reason, guidance = self.job.precheck()
             if not ok:
+                self._emit("PRECHECK", {"status": "fail", "reason": reason, "guidance": guidance})
                 self._emit("PRECHECK_FAIL", {"reason": reason, "guidance": guidance})
+                if self.job.feature_key:
+                    self._emit(
+                        "BLOCKED_BY_CAPABILITY",
+                        {"feature": self.job.feature_key, "reason": reason, "guidance": guidance},
+                    )
                 self.signals.result.emit(
                     {
                         "job_id": self.job.job_id,
                         "name": self.job.name,
                         "category": self.job.category,
+                        "feature_key": self.job.feature_key,
                         "status": "failed",
                         "error": reason,
                         "guidance": guidance,
@@ -108,6 +117,7 @@ class JobWorker(QRunnable):
                 )
                 self._emit("JOB_FAIL", {"reason": reason})
                 return
+            self._emit("PRECHECK", {"status": "ok"})
             self._emit("PRECHECK_OK", {})
 
         self._emit("EXEC_START", {})
@@ -121,6 +131,7 @@ class JobWorker(QRunnable):
                     "job_id": self.job.job_id,
                     "name": self.job.name,
                     "category": self.job.category,
+                    "feature_key": self.job.feature_key,
                     "status": "failed",
                     "error": str(exc),
                     "guidance": "",
@@ -147,12 +158,14 @@ class JobWorker(QRunnable):
 
         summary = payload.get("summary", {})
         counts = payload.get("counts", {})
+        self._emit("RESULT_COUNT", {"counts": counts})
         self._emit("RESULT", {"summary": summary, "counts": counts})
         self.signals.result.emit(
             {
                 "job_id": self.job.job_id,
                 "name": self.job.name,
                 "category": self.job.category,
+                "feature_key": self.job.feature_key,
                 "status": "success" if result.returncode == 0 else "failed",
                 "error": result.error or "",
                 "guidance": "",
@@ -200,6 +213,11 @@ class JobManager(QObject):
         elif event_type == "JOB_FAIL":
             detail = event.get("detail", {})
             self.log_callback(f"[job] {name} failed: {detail.get('reason')}")
+        elif event_type == "BLOCKED_BY_CAPABILITY":
+            detail = event.get("detail", {})
+            feature = detail.get("feature", "unknown")
+            reason = detail.get("reason", "blocked")
+            self.log_callback(f"[job] {name} blocked by {feature}: {reason}")
 
     def _handle_result(self, result: Dict[str, Any]) -> None:
         self.job_history.append(result)
