@@ -106,41 +106,34 @@ def load_settings():
     on_backend_changed(backend_combo.currentIndex())
 ```
 
-### 2. Header Badge (Show Current Backend)
+### 2. Backend Status Chip (Recommended - Sleek UX)
 
-Add a status badge to your main window header:
+Add the sleek status chip to your header for instant visual feedback:
 
 ```python
-from PyQt6.QtWidgets import QLabel
+from gui_backend_status import create_backend_status_chip
 
-backend_badge = QLabel()
-backend_badge.setStyleSheet("""
-    QLabel {
-        padding: 4px 8px;
-        border-radius: 4px;
-        font-weight: bold;
-        color: white;
-    }
-""")
+# In your main window __init__
+self.status_chip = create_backend_status_chip(self)
+self.status_chip.clicked.connect(self.show_diagnostics_dialog)
 
-def update_backend_badge():
-    settings = QSettings("NetNinja", "NetNinja")
-    backend = settings.value("backend_mode", "Windows Native")
-    distro = settings.value("wsl_distro", "(default)")
-    
-    if backend == "WSL Bridge":
-        distro_name = distro if distro != "(default)" else "default"
-        backend_badge.setText(f"Backend: WSL ({distro_name})")
-        backend_badge.setStyleSheet(backend_badge.styleSheet() + 
-            "QLabel { background-color: #4CAF50; }")
-    else:
-        backend_badge.setText("Backend: Windows Native")
-        backend_badge.setStyleSheet(backend_badge.styleSheet() + 
-            "QLabel { background-color: #2196F3; }")
+# Add to header layout
+header_layout.addWidget(self.status_chip)
 
-# Call on startup and after settings change
-update_backend_badge()
+# The chip automatically:
+# - Shows backend mode (Windows Native / WSL Bridge)
+# - Color codes health (Green=OK, Yellow=Warning, Red=Error)
+# - Auto-refreshes every 30 seconds
+# - Shows diagnostics on click
 ```
+
+**Color Coding:**
+- 🟢 Green: Everything OK
+- 🟡 Yellow: Tools missing or warnings
+- 🔴 Red: Backend not available
+- ⚪ Gray: Unknown/checking
+
+See `BACKEND_STATUS_CHIP_GUIDE.md` for detailed integration guide.
 
 ### 3. Provider Initialization
 
