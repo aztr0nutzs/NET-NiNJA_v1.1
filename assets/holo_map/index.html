@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, height=device-height, initial-scale=1, viewport-fit=cover"
+    />
+    <title>NetNinja Holo Map</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #050b12;
+      }
+      #map-root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+      #map-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      #map-overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        color: rgba(210, 240, 255, 0.8);
+        font: 12px "Consolas", "SFMono-Regular", "Menlo", monospace;
+        letter-spacing: 0.4px;
+      }
+      #map-overlay .label {
+        position: absolute;
+        left: 14px;
+        top: 10px;
+        text-transform: uppercase;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map-root">
+      <canvas id="map-canvas"></canvas>
+      <div id="map-overlay">
+        <div class="label">Holographic Discovery Map</div>
+      </div>
+    </div>
+    <script>
+      (() => {
+        const container = document.getElementById("map-root");
+        const canvas = document.getElementById("map-canvas");
+        const ctx = canvas.getContext("2d", { alpha: false });
+        const state = {
+          interfaces: [],
+          aps: [],
+          hosts: [],
+        };
+
+        function resizeRenderer() {
+          const rect = container.getBoundingClientRect();
+          const width = Math.max(1, rect.width);
+          const height = Math.max(1, rect.height);
+          const dpr = window.devicePixelRatio || 1;
+          canvas.width = Math.floor(width * dpr);
+          canvas.height = Math.floor(height * dpr);
+          canvas.style.width = `${width}px`;
+          canvas.style.height = `${height}px`;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          render();
+        }
+
+        function drawGrid(width, height) {
+          ctx.save();
+          ctx.strokeStyle = "rgba(60, 140, 190, 0.18)";
+          ctx.lineWidth = 1;
+          const step = 36;
+          for (let x = 0; x <= width; x += step) {
+            ctx.beginPath();
+            ctx.moveTo(x + 0.5, 0);
+            ctx.lineTo(x + 0.5, height);
+            ctx.stroke();
+          }
+          for (let y = 0; y <= height; y += step) {
+            ctx.beginPath();
+            ctx.moveTo(0, y + 0.5);
+            ctx.lineTo(width, y + 0.5);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+
+        function buildNodes() {
+          const nodes = [];
+          state.interfaces.forEach((item) => {
+            nodes.push({ type: "iface", label: item.name || "iface" });
+          });
+          state.aps.forEach((item) => {
+            nodes.push({ type: "ap", label: item.ssid || "ap" });
+          });
+          state.hosts.forEach((item) => {
+            nodes.push({ type: "host", label: item.ip || "host" });
+          });
+          return nodes;
+        }
+
+        function renderNodes(nodes, width, height) {
+          const count = nodes.length;
+          if (!count) {
+            ctx.save();
+            ctx.fillStyle = "rgba(200, 230, 255, 0.5)";
+            ctx.font = "14px Consolas, monospace";
+            ctx.fillText("Awaiting discovery data...", 18, height - 18);
+            ctx.restore();
+            return;
+          }
+
+          const centerX = width / 2;
+          const centerY = height / 2;
+          const radius = Math.min(width, height) * 0.32;
+          nodes.forEach((node, idx) => {
+            const angle = (idx / count) * Math.PI * 2;
+            node.x = centerX + Math.cos(angle) * radius;
+            node.y = centerY + Math.sin(angle) * radius;
+          });
+
+          ctx.save();
+          ctx.strokeStyle = "rgba(120, 200, 255, 0.2)";
+          nodes.forEach((node) => {
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.lineTo(node.x, node.y);
+            ctx.stroke();
+          });
+          ctx.restore();
+
+          nodes.forEach((node) => {
+            let color = "#6bdcff";
+            if (node.type === "ap") {
+              color = "#6bffa8";
+            } else if (node.type === "host") {
+              color = "#ff7fd1";
+            }
+            ctx.beginPath();
+            ctx.fillStyle = color;
+            ctx.shadowColor = color;
+            ctx.shadowBlur = 12;
+            ctx.arc(node.x, node.y, 5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            ctx.fillStyle = "rgba(210, 240, 255, 0.85)";
+            ctx.font = "11px Consolas, monospace";
+            ctx.fillText(node.label, node.x + 10, node.y - 10);
+          });
+
+          ctx.beginPath();
+          ctx.strokeStyle = "rgba(130, 220, 255, 0.6)";
+          ctx.lineWidth = 1.5;
+          ctx.arc(centerX, centerY, 14, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        function render() {
+          const rect = container.getBoundingClientRect();
+          const width = rect.width;
+          const height = rect.height;
+          const gradient = ctx.createRadialGradient(
+            width * 0.5,
+            height * 0.4,
+            Math.min(width, height) * 0.1,
+            width * 0.5,
+            height * 0.5,
+            Math.min(width, height) * 0.9
+          );
+          gradient.addColorStop(0, "#07111a");
+          gradient.addColorStop(1, "#03070b");
+          ctx.fillStyle = gradient;
+          ctx.fillRect(0, 0, width, height);
+
+          drawGrid(width, height);
+          const nodes = buildNodes();
+          renderNodes(nodes, width, height);
+        }
+
+        window.netNinjaUpdate = (payload) => {
+          if (!payload || typeof payload !== "object") {
+            return;
+          }
+          state.interfaces = Array.isArray(payload.interfaces) ? payload.interfaces : [];
+          state.aps = Array.isArray(payload.aps) ? payload.aps : [];
+          state.hosts = Array.isArray(payload.hosts) ? payload.hosts : [];
+          render();
+        };
+
+        if (typeof ResizeObserver !== "undefined") {
+          const observer = new ResizeObserver(() => resizeRenderer());
+          observer.observe(container);
+        }
+
+        window.addEventListener("resize", resizeRenderer);
+        resizeRenderer();
+      })();
+    </script>
+  </body>
+</html>

@@ -14,12 +14,14 @@ import json
 import subprocess
 import sys
 import time
+import platform
+import tempfile
 from pathlib import Path
 from datetime import datetime
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QThread, pyqtSignal, QObject, QUrl
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, pyqtSignal, QUrl, QSettings, QByteArray
 
 import shutil  # For checking tool availability
 
@@ -29,6 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -39,13 +42,17 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QAbstractItemView,
     QScrollArea,
     QSplitter,
     QStackedWidget,
     QToolBar,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QInputDialog,
@@ -67,130 +74,12 @@ if str(BASE_DIR.parent) not in sys.path:
 from gui_components import PanelWindow, PanelWorkspacePage
 from gui_theme import apply_bio_theme
 from security_utils import sanitize_command_for_display
+from capabilities import detect_capabilities
+from providers import get_provider
+from providers.base import HostRecord, InterfaceRecord, NeighborRecord, RouteRecord, SocketRecord, WifiAPRecord
+from job_pipeline import ExecutionResult, JobManager, JobSpec
 
 
-
-
-class CommandThread(QThread):
-    """Runs a shell command and emits its output line by line.
-
-    SECURITY: Uses argv lists with shell=False to prevent command injection.
-    Handles sudo by piping the password to stdin, avoiding password exposure.
-    """
-
-    output = pyqtSignal(str)
-    finished = pyqtSignal(int)
-
-    def __init__(self, command: Iterable[str] | str, sudo_password: Optional[str] = None, sanitize_output: bool = True):
-        super().__init__()
-        self.command = command
-        self.sudo_password = sudo_password
-        self.sanitize_output = sanitize_output
-        self.process: Optional[subprocess.Popen] = None
-
-    def _build_argv(self) -> List[str]:
-        if isinstance(self.command, (list, tuple)):
-            return list(self.command)
-        return shlex.split(self.command)
-
-    def run(self) -> None:
-        try:
-            cmd_args = self._build_argv()
-
-            # SECURITY & RELIABILITY: Use a new process group to manage child processes.
-            if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-                preexec_fn = None
-            else:
-                creationflags = 0
-                preexec_fn = os.setsid
-
-            if cmd_args and cmd_args[0] == "sudo":
-                cmd_args.insert(1, "-S")
-                self.process = subprocess.Popen(
-                    cmd_args,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    preexec_fn=preexec_fn,
-                    creationflags=creationflags,
-                )
-                if self.process.stdin:
-                    if self.sudo_password:
-                        self.process.stdin.write(self.sudo_password + "\n")
-                        self.process.stdin.flush()
-                    self.process.stdin.close()
-            else:
-                self.process = subprocess.Popen(
-                    cmd_args,
-                    shell=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    preexec_fn=preexec_fn,
-                    creationflags=creationflags,
-                )
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            self.output.emit(f"[error] {exc}")
-            self.finished.emit(1)
-            return
-
-        assert self.process.stdout
-        for line in iter(self.process.stdout.readline, ""):
-            output_line = line.rstrip()
-            if "sudo: a password is required" in output_line.lower() or "sudo: incorrect password" in output_line.lower():
-                self.output.emit("[error] Sudo password was incorrect or is required.")
-            if self.sanitize_output:
-                output_line = self._sanitize_output(output_line)
-            self.output.emit(output_line)
-        self.process.stdout.close()
-        return_code = self.process.wait()
-        self.finished.emit(return_code)
-
-    def _sanitize_output(self, line: str) -> str:
-        """Remove sensitive patterns from output to prevent credential leakage."""
-        import re
-        line = re.sub(r'(password|passwd|pwd)[=:\s]+\S+', r'\1=***REDACTED***', line, flags=re.IGNORECASE)
-        line = re.sub(r'(api[_-]?key|token|secret)[=:\s]+\S+', r'\1=***REDACTED***', line, flags=re.IGNORECASE)
-        line = re.sub(r'(Authorization|Bearer)[:\s]+\S+', r'\1: ***REDACTED***', line, flags=re.IGNORECASE)
-        return line
-
-    def terminate(self) -> None:
-        """Terminate the underlying process group if it is running."""
-        if not self.process or self.process.poll() is not None:
-            return
-        try:
-            if sys.platform == "win32":
-                try:
-                    self.process.send_signal(subprocess.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-                    time.sleep(0.3)
-                except Exception:
-                    pass
-                if self.process.poll() is None:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.process.pid)], capture_output=True)
-                self.output.emit("[status] Task terminated.")
-                return
-
-            # POSIX path
-            pgid = os.getpgid(self.process.pid)
-            os.killpg(pgid, 15)  # SIGTERM
-            time.sleep(0.5)
-            if self.process.poll() is None:
-                os.killpg(pgid, 9)  # SIGKILL
-            self.output.emit("[status] Task terminated.")
-        except (ProcessLookupError, PermissionError):
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
-        except Exception:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
 
 
 def quote(value: Optional[str]) -> str:
@@ -219,14 +108,17 @@ def apply_glow_effect(widget: QWidget, color: str = "#7c5dff") -> None:
         try:
             animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         except Exception:
-            pass
+            print("[warn] Glow animation easing not available")
     animation.start()
     widget._glow_animation = animation
 
 
-def create_glowing_button(text: str, callback) -> QPushButton:
+def create_glowing_button(text: str, callback, *, enabled: bool = True, tooltip: str = "") -> QPushButton:
     button = QPushButton(text)
     button.clicked.connect(lambda checked=False, cb=callback: cb())
+    button.setEnabled(enabled)
+    if tooltip:
+        button.setToolTip(tooltip)
     apply_glow_effect(button, color="#c87bff")
     return button
 
@@ -334,6 +226,8 @@ class ReaperHeader(QFrame):
 class TargetField(QWidget):
     """Reusable target selector with editable combo box."""
 
+    scan_requested = pyqtSignal(object)
+
     def __init__(self, label: str, parent: Optional[QWidget] = None, *, share_history: bool = True):
         super().__init__(parent)
         self._history: List[str] = []
@@ -350,7 +244,7 @@ class TargetField(QWidget):
         layout.addWidget(self.combo)
 
         self.scan_btn = QPushButton("Scan Networks")
-        self.scan_btn.clicked.connect(self.scan_networks)
+        self.scan_btn.clicked.connect(lambda: self.scan_requested.emit(self))
         layout.addWidget(self.scan_btn)
 
     def set_history(self, entries: Iterable[str]) -> None:
@@ -364,31 +258,6 @@ class TargetField(QWidget):
 
     def value(self) -> str:
         return self.combo.currentText().strip()
-
-    def scan_networks(self) -> None:
-        """Scan for local network IPs and add to combo."""
-        try:
-            result = subprocess.run(
-                ["ip", "addr", "show"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            ips = []
-            for line in result.stdout.splitlines():
-                if "inet " in line and not "127.0.0.1" in line:
-                    ip = line.split()[1].split('/')[0]
-                    ips.append(ip)
-            if ips:
-                for ip in ips:
-                    if ip not in self._history:
-                        self._history.append(ip)
-                self.set_history(self._history)
-                QMessageBox.information(self, "Scan Complete", f"Found IPs: {', '.join(ips)}")
-            else:
-                QMessageBox.information(self, "Scan Complete", "No local IPs found.")
-        except Exception as e:
-            QMessageBox.warning(self, "Scan Failed", f"Error scanning networks: {e}")
 
 
 class CategoryTab(QWidget):
@@ -427,6 +296,10 @@ class CategoryTab(QWidget):
         self.panels.append(panel)
         return panel
 
+    def run_job(self, job: JobSpec) -> None:
+        if self.main_window and hasattr(self.main_window, "job_manager"):
+            self.main_window.job_manager.run_job(job)
+
     def require_authorization(self, action: str) -> bool:
         """Ask the user to confirm dangerous actions by typing a phrase."""
         phrase = "I AM AUTHORIZED"
@@ -442,160 +315,125 @@ class CategoryTab(QWidget):
 # ════════════════════════════════════════════════════════════════════════════
 
 class JobsTab(QWidget):
-    """Simple job status page that displays the current job queue."""
+    """Structured job history, diagnostics export, and raw output viewer."""
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, job_manager: JobManager, save_diagnostics, run_self_test, parent: Optional[QWidget] = None):
         super().__init__(parent)
+        self.job_manager = job_manager
+        self._results_by_id: Dict[str, Dict[str, Any]] = {}
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
-        self.refresh_button = QPushButton("Refresh Jobs")
-        self.refresh_button.clicked.connect(self.refresh_jobs)
-        layout.addWidget(self.refresh_button)
-        self.job_display = QPlainTextEdit()
-        self.job_display.setReadOnly(True)
-        self.job_display.setPlaceholderText("Job queue will appear here...")
-        layout.addWidget(self.job_display)
+
+        action_row = QHBoxLayout()
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh_jobs)
+        save_button = QPushButton("Save Diagnostics")
+        save_button.clicked.connect(save_diagnostics)
+        self.self_test_button = QPushButton("Run Self Test")
+        self.self_test_button.clicked.connect(run_self_test)
+        action_row.addWidget(refresh_button)
+        action_row.addWidget(save_button)
+        action_row.addWidget(self.self_test_button)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+
+        self.jobs_table = QTableWidget(0, 7)
+        self.jobs_table.setHorizontalHeaderLabels(
+            ["ID", "Name", "Category", "Status", "Return", "Items", "Duration (s)"]
+        )
+        self.jobs_table.horizontalHeader().setStretchLastSection(True)
+        self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.jobs_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.jobs_table.itemSelectionChanged.connect(self._on_job_selected)
+        layout.addWidget(self.jobs_table, 2)
+
+        detail_row = QHBoxLayout()
+        self.summary_table = QTableWidget(0, 2)
+        self.summary_table.setHorizontalHeaderLabels(["Field", "Value"])
+        self.summary_table.horizontalHeader().setStretchLastSection(True)
+        self.summary_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        detail_row.addWidget(self.summary_table, 2)
+
+        self.raw_button = QPushButton("View Raw Output")
+        self.raw_button.clicked.connect(self._show_raw_output)
+        detail_controls = QVBoxLayout()
+        detail_controls.addWidget(self.raw_button)
+        detail_controls.addStretch()
+        detail_row.addLayout(detail_controls, 0)
+        layout.addLayout(detail_row, 1)
+
+        self.job_manager.result_emitted.connect(self._on_job_result)
         self.refresh_jobs()
 
     def refresh_jobs(self) -> None:
-        import json  # Imported lazily to avoid overhead on startup
-        job_file = os.path.expanduser("~/.netreaper/jobs.json")
-        if not os.path.exists(job_file):
-            self.job_display.setPlainText("No jobs defined.")
+        self.jobs_table.setRowCount(0)
+        for result in self.job_manager.job_history:
+            self._add_job_row(result)
+
+    def _on_job_result(self, result: Dict[str, Any]) -> None:
+        self._add_job_row(result)
+
+    def _add_job_row(self, result: Dict[str, Any]) -> None:
+        job_id = result.get("job_id", "")
+        self._results_by_id[job_id] = result
+        row = self.jobs_table.rowCount()
+        self.jobs_table.insertRow(row)
+        self.jobs_table.setItem(row, 0, QTableWidgetItem(job_id))
+        self.jobs_table.setItem(row, 1, QTableWidgetItem(result.get("name", "")))
+        self.jobs_table.setItem(row, 2, QTableWidgetItem(result.get("category", "")))
+        self.jobs_table.setItem(row, 3, QTableWidgetItem(result.get("status", "")))
+        self.jobs_table.setItem(row, 4, QTableWidgetItem(str(result.get("returncode", ""))))
+        items = result.get("payload", {}).get("items", [])
+        self.jobs_table.setItem(row, 5, QTableWidgetItem(str(len(items))))
+        duration = result.get("elapsed", 0.0)
+        self.jobs_table.setItem(row, 6, QTableWidgetItem(f"{duration:.2f}"))
+
+    def _on_job_selected(self) -> None:
+        selected = self.jobs_table.selectedItems()
+        if not selected:
             return
-        try:
-            with open(job_file, "r", encoding="utf-8") as f:
-                jobs = json.load(f)
-        except Exception as exc:
-            self.job_display.setPlainText(f"Error loading jobs: {exc}")
+        job_id = selected[0].text()
+        result = self._results_by_id.get(job_id)
+        if not result:
             return
-        if not jobs:
-            self.job_display.setPlainText("No jobs in queue.")
+        summary = result.get("summary", {}) or {}
+        self.summary_table.setRowCount(len(summary))
+        for row, (key, value) in enumerate(summary.items()):
+            self.summary_table.setItem(row, 0, QTableWidgetItem(str(key)))
+            self.summary_table.setItem(row, 1, QTableWidgetItem(str(value)))
+
+    def _show_raw_output(self) -> None:
+        selected = self.jobs_table.selectedItems()
+        if not selected:
             return
-        lines: List[str] = []
-        header = f"{'ID':8} | {'Status':8} | {'Wizard':12} | {'Target':15} | {'Created'}"
-        lines.append(header)
-        lines.append("-" * len(header))
-        for job_id, job in jobs.items():
-            status = job.get("status", "unknown")
-            wizard = job.get("wizard", "")
-            target = job.get("target", "")
-            created = job.get("created_at", "")
-            lines.append(f"{job_id[:8]:8} | {status:8} | {wizard:12} | {target:15} | {created}")
-        self.job_display.setPlainText("\n".join(lines))
+        job_id = selected[0].text()
+        result = self._results_by_id.get(job_id, {})
+        raw = result.get("raw", {})
+        stdout_lines = raw.get("stdout", [])
+        stderr_lines = raw.get("stderr", [])
+        text = []
+        if stdout_lines:
+            text.append("STDOUT:")
+            text.extend(stdout_lines)
+        if stderr_lines:
+            text.append("")
+            text.append("STDERR:")
+            text.extend(stderr_lines)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Raw Output: {job_id}")
+        layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText("\n".join(text))
+        layout.addWidget(editor)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.resize(720, 520)
+        dialog.exec()
 
-
-
-class DiscoveryThread(QThread):
-    """Background discovery for interfaces, nearby Wi‑Fi APs, and neighbor hosts."""
-
-    log = pyqtSignal(str)
-    result = pyqtSignal(dict)
-
-    def __init__(self, *, rescan_wifi: bool = True, parent: Optional[QObject] = None):
-        super().__init__(parent)
-        self.rescan_wifi = rescan_wifi
-
-    def run(self) -> None:
-        payload = {"interfaces": [], "aps": [], "hosts": [], "errors": []}
-
-        def has(cmd: str) -> bool:
-            return shutil.which(cmd) is not None
-
-        # Interfaces
-        try:
-            if has("ip"):
-                p = subprocess.run(["ip", "-j", "addr", "show"], capture_output=True, text=True)
-                if p.returncode == 0:
-                    data = json.loads(p.stdout or "[]")
-                    for it in data:
-                        name = it.get("ifname") or ""
-                        state = it.get("operstate") or ""
-                        mac = it.get("address") or ""
-                        ipv4, ipv6 = [], []
-                        for ai in it.get("addr_info", []) or []:
-                            fam = ai.get("family")
-                            local = ai.get("local")
-                            if not local:
-                                continue
-                            if fam == "inet":
-                                ipv4.append(local)
-                            elif fam == "inet6":
-                                ipv6.append(local)
-                        payload["interfaces"].append({"name": name, "state": state, "mac": mac, "ipv4": ipv4, "ipv6": ipv6})
-                else:
-                    payload["errors"].append("Interface discovery failed (ip).")
-                    self.log.emit(f"[DISCOVERY] ip error: {p.stderr.strip()}")
-            else:
-                payload["errors"].append("Missing tool: ip (interface discovery unavailable).")
-        except Exception as e:
-            payload["errors"].append("Interface discovery error.")
-            self.log.emit(f"[DISCOVERY] Interface exception: {e!r}")
-
-        # Neighbors / ARP
-        try:
-            if has("ip"):
-                p = subprocess.run(["ip", "neigh"], capture_output=True, text=True)
-                if p.returncode == 0:
-                    for line in (p.stdout or "").splitlines():
-                        parts = line.split()
-                        if not parts:
-                            continue
-                        ip_addr = parts[0]
-                        mac = ""
-                        state = parts[-1] if parts else ""
-                        if "lladdr" in parts:
-                            try:
-                                mac = parts[parts.index("lladdr") + 1]
-                            except Exception:
-                                mac = ""
-                        payload["hosts"].append({"ip": ip_addr, "mac": mac, "state": state})
-                else:
-                    payload["errors"].append("Neighbor discovery failed (ip neigh).")
-                    self.log.emit(f"[DISCOVERY] ip neigh error: {p.stderr.strip()}")
-            else:
-                payload["errors"].append("Missing tool: ip (neighbor discovery unavailable).")
-        except Exception as e:
-            payload["errors"].append("Neighbor discovery error.")
-            self.log.emit(f"[DISCOVERY] Neighbor exception: {e!r}")
-
-        # Wi‑Fi scan
-        try:
-            if has("nmcli"):
-                cmd = ["nmcli", "-t", "-f", "SSID,BSSID,CHAN,SIGNAL,SECURITY", "dev", "wifi", "list"]
-                if self.rescan_wifi:
-                    cmd += ["--rescan", "yes"]
-                p = subprocess.run(cmd, capture_output=True, text=True)
-                if p.returncode == 0:
-                    for raw in (p.stdout or "").splitlines():
-                        if not raw.strip():
-                            continue
-                        parts = raw.rsplit(":", 4)
-                        if len(parts) != 5:
-                            continue
-                        ssid, bssid, chan, signal, security = parts
-                        ssid = ssid.strip()
-                        bssid = bssid.strip()
-                        try:
-                            chan_i = int(chan.strip()) if chan.strip() else None
-                        except Exception:
-                            chan_i = None
-                        try:
-                            sig_i = int(signal.strip()) if signal.strip() else 0
-                        except Exception:
-                            sig_i = 0
-                        payload["aps"].append({"ssid": ssid, "bssid": bssid, "chan": chan_i, "signal": sig_i, "security": security.strip()})
-                else:
-                    payload["errors"].append("Wi‑Fi scan failed (nmcli).")
-                    self.log.emit(f"[DISCOVERY] nmcli error: {p.stderr.strip()}")
-            else:
-                payload["errors"].append("Missing tool: nmcli (Wi‑Fi discovery unavailable).")
-        except Exception as e:
-            payload["errors"].append("Wi‑Fi discovery error.")
-            self.log.emit(f"[DISCOVERY] Wi‑Fi exception: {e!r}")
-
-        self.result.emit(payload)
 
 
 class WizardTab(QWidget):
@@ -621,6 +459,9 @@ class WizardTab(QWidget):
         # Target input
         self.target_field = TargetField("Target")
         self.target_field.combo.setPlaceholderText("Enter target (IP, domain, subnet, or interface)")
+        self.target_field.scan_requested.connect(lambda field: self.main_window.scan_targets_for_field(field))
+        if self.main_window:
+            self.main_window.guard_button(self.target_field.scan_btn, feature_flag="can_list_interfaces")
         self.layout.addWidget(self.target_field)
         if self.main_window:
             self.main_window.register_target_field(self.target_field)
@@ -651,6 +492,8 @@ class WizardTab(QWidget):
 
         # Launch button
         self.launch_button = create_glowing_button("Deploy Reaper Mode", self.launch_reaper)
+        if self.main_window:
+            self.main_window.guard_button(self.launch_button, required_tools=["netreaper"])
         self.layout.addWidget(self.launch_button)
 
         # Initialize UI
@@ -689,7 +532,8 @@ class WizardTab(QWidget):
         if verbose:
             base_cmd += " --verbose"
         if save_results:
-            base_cmd += f" --output /tmp/reaper_{mode.lower().replace(' ', '_')}_{int(time.time())}.log"
+            out_path = os.path.join(tempfile.gettempdir(), f"reaper_{mode.lower().replace(' ', '_')}_{int(time.time())}.log")
+            base_cmd += f" --output {shlex.quote(out_path)}"
 
         self.status_label.setText(f"Deploying {mode}...")
         self.progress.setValue(0)
@@ -715,47 +559,43 @@ class WizardTab(QWidget):
         return "web"
 
     def _start_command(self, command: str, description: str) -> None:
-        """Launch a wizard with enhanced error handling and progress tracking."""
-        self.progress.setValue(10)
-        
-        # Check for sudo and prompt if needed
-        if command.strip().startswith("sudo"):
-            password, ok = QInputDialog.getText(self.main_window, "Sudo Password", "Enter your password for sudo:", QLineEdit.EchoMode.Password)
-            if not ok:
-                self.status_label.setText("Sudo required, but password not provided.")
-                self.progress.setVisible(False)
-                self.launch_button.setEnabled(True)
-                return
-            thread = CommandThread(command, sudo_password=password)
-        else:
-            thread = CommandThread(command)
+        """Launch a wizard command using the unified job pipeline."""
+        self.progress.setRange(0, 0)
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self.launch_button.setEnabled(False)
 
-        def handle_output(line: str) -> None:
-            mw: NetReaperGui = self.parent()
-            if hasattr(mw, "output_log"):
-                mw.output_log.appendPlainText(line)
-            if "Progress:" in line:
-                import re
-                m = re.search(r"\[(\d+)/(\d+)\]", line)
-                if m:
-                    try:
-                        cur = int(m.group(1))
-                        total = int(m.group(2))
-                        val = int(100 * cur / total)
-                        self.progress.setValue(max(10, min(90, val)))
-                    except Exception:
-                        pass
-        thread.output.connect(handle_output)
-        def on_finished(code: int) -> None:
-            self.progress.setValue(100)
-            if code == 0:
+        if not self.main_window:
+            self.status_label.setText("Wizard unavailable: no main window")
+            self.progress.setVisible(False)
+            self.launch_button.setEnabled(True)
+            return
+
+        job_id = self.main_window.execute_command(command, description)
+        if not job_id:
+            self.status_label.setText("Wizard start failed")
+            self.progress.setVisible(False)
+            self.launch_button.setEnabled(True)
+            return
+
+        def on_result(result: dict) -> None:
+            if result.get("job_id") != job_id:
+                return
+            status = result.get("status", "failed")
+            if status == "success":
                 self.status_label.setText(f"{description} completed successfully.")
             else:
-                self.status_label.setText(f"{description} failed with code {code}.")
+                self.status_label.setText(f"{description} failed.")
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
             QTimer.singleShot(3000, lambda: self.progress.setVisible(False))
             self.launch_button.setEnabled(True)
-        thread.finished.connect(on_finished)
-        thread.start()
+            try:
+                self.main_window.job_manager.result_emitted.disconnect(on_result)
+            except Exception as exc:
+                self.main_window._append_log_line(f"[wizard] Result disconnect failed: {exc}")
+
+        self.main_window.job_manager.result_emitted.connect(on_result)
 
     def run_web(self) -> None:
         target = self.web_target.text().strip()
@@ -788,6 +628,7 @@ class ScanTab(CategoryTab):
     def __init__(self, executor, main_window):
         super().__init__(executor, main_window)
         self.main_window = main_window
+        self._settings = QSettings("NetNinja", "NetReaper")
         self.target_field = TargetField("Target")
         target_wrap = QWidget()
         target_layout = QVBoxLayout(target_wrap)
@@ -797,11 +638,8 @@ class ScanTab(CategoryTab):
         target_layout.addWidget(self.discovery_panel)
 
         # Ensure the Scan Networks button triggers structured discovery
-        try:
-            self.target_field.scan_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.target_field.scan_btn.clicked.connect(self.main_window.start_discovery)
+        self.target_field.scan_requested.connect(lambda _field=None: self.main_window.start_discovery())
+        self.main_window.guard_button(self.target_field.scan_btn, feature_flag="can_list_interfaces")
         self.main_window.register_target_field(self.target_field)
 
         self.scan_presets = {
@@ -825,30 +663,66 @@ class ScanTab(CategoryTab):
         v.setContentsMargins(0, 10, 0, 0)
         v.setSpacing(10)
 
+        self.discovery_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.discovery_splitter.setObjectName("discoverySplitter")
+        self.discovery_splitter.setChildrenCollapsible(False)
+
+        holo_container = QFrame()
+        holo_container.setObjectName("holoMapContainer")
+        holo_container.setMinimumHeight(280)
+        holo_container.setMaximumHeight(520)
+        holo_layout = QVBoxLayout(holo_container)
+        holo_layout.setContentsMargins(0, 0, 0, 0)
+        holo_layout.setSpacing(0)
+
         self.holo_view = None
         if QWebEngineView is not None:
             self.holo_view = QWebEngineView()
             self.holo_view.setObjectName("holoMapView")
-            self.holo_view.setMinimumHeight(320)
-            self.holo_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.holo_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             html_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "holo_map", "index.html"))
             self.holo_view.load(QUrl.fromLocalFile(html_path))
-            v.addWidget(self.holo_view)
+            holo_layout.addWidget(self.holo_view)
         else:
             warn = QLabel("Holo map requires PyQt6-WebEngine (QtWebEngine). Install it to enable the 3D discovery map.")
             warn.setWordWrap(True)
+            warn.setAlignment(Qt.AlignmentFlag.AlignCenter)
             warn.setStyleSheet("color: rgba(200,220,255,0.75); padding: 8px;")
-            v.addWidget(warn)
+            holo_layout.addWidget(warn)
+
+        self.discovery_splitter.addWidget(holo_container)
 
         self.discovery_tabs = QTabWidget()
         self.discovery_tabs.setObjectName("discoveryTabs")
+        self.discovery_tabs.setMinimumHeight(220)
 
-        self.iface_table = QTableWidget(0, 5)
-        self.iface_table.setHorizontalHeaderLabels(["Name", "State", "MAC", "IPv4", "IPv6"])
+        self.iface_table = QTableWidget(0, 6)
+        self.iface_table.setHorizontalHeaderLabels(["Name", "State", "MAC", "IPv4", "IPv6", "Speed"])
         self.iface_table.horizontalHeader().setStretchLastSection(True)
         self.iface_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.iface_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.iface_table.setAlternatingRowColors(True)
+
+        self.route_table = QTableWidget(0, 4)
+        self.route_table.setHorizontalHeaderLabels(["Destination", "Gateway", "Interface", "Metric"])
+        self.route_table.horizontalHeader().setStretchLastSection(True)
+        self.route_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.route_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.route_table.setAlternatingRowColors(True)
+
+        self.socket_table = QTableWidget(0, 6)
+        self.socket_table.setHorizontalHeaderLabels(["Proto", "Local", "Remote", "State", "PID", "Process"])
+        self.socket_table.horizontalHeader().setStretchLastSection(True)
+        self.socket_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.socket_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.socket_table.setAlternatingRowColors(True)
+
+        self.neighbor_table = QTableWidget(0, 4)
+        self.neighbor_table.setHorizontalHeaderLabels(["IP", "MAC", "State", "Interface"])
+        self.neighbor_table.horizontalHeader().setStretchLastSection(True)
+        self.neighbor_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.neighbor_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.neighbor_table.setAlternatingRowColors(True)
 
         self.ap_table = QTableWidget(0, 5)
         self.ap_table.setHorizontalHeaderLabels(["SSID", "BSSID", "CH", "Signal", "Security"])
@@ -857,59 +731,155 @@ class ScanTab(CategoryTab):
         self.ap_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.ap_table.setAlternatingRowColors(True)
 
-        self.host_table = QTableWidget(0, 3)
-        self.host_table.setHorizontalHeaderLabels(["IP", "MAC", "State"])
+        self.host_table = QTableWidget(0, 4)
+        self.host_table.setHorizontalHeaderLabels(["IP", "MAC", "State", "Source"])
         self.host_table.horizontalHeader().setStretchLastSection(True)
         self.host_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.host_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.host_table.setAlternatingRowColors(True)
 
         self.discovery_tabs.addTab(self.iface_table, "Interfaces")
-        self.discovery_tabs.addTab(self.ap_table, "Nearby Wi‑Fi")
-        self.discovery_tabs.addTab(self.host_table, "Neighbors")
-        v.addWidget(self.discovery_tabs)
+        self.discovery_tabs.addTab(self.route_table, "Routes")
+        self.discovery_tabs.addTab(self.socket_table, "Sockets")
+        self.discovery_tabs.addTab(self.neighbor_table, "Neighbors")
+        self.discovery_tabs.addTab(self.ap_table, "Nearby Wi-Fi")
+        self.discovery_tabs.addTab(self.host_table, "Hosts")
+        self.discovery_splitter.addWidget(self.discovery_tabs)
+        v.addWidget(self.discovery_splitter)
+
+        self.discovery_splitter.splitterMoved.connect(lambda _pos, _index: self._save_discovery_splitter_state())
+        if not self._restore_discovery_splitter_state():
+            self.discovery_splitter.setSizes([360, 520])
         return wrapper
+
+    def _restore_discovery_splitter_state(self) -> bool:
+        state = self._settings.value("discovery/splitter_state", None)
+        if isinstance(state, QByteArray):
+            return self.discovery_splitter.restoreState(state)
+        if isinstance(state, (bytes, bytearray)):
+            return self.discovery_splitter.restoreState(QByteArray(state))
+        return False
+
+    def _save_discovery_splitter_state(self) -> None:
+        try:
+            if hasattr(self, "discovery_splitter"):
+                self._settings.setValue("discovery/splitter_state", self.discovery_splitter.saveState())
+        except Exception as exc:
+            if self.main_window:
+                self.main_window._append_log_line(f"[settings] Splitter save failed: {exc}")
 
     def update_discovery(self, payload: dict) -> None:
         interfaces = payload.get("interfaces", []) or []
+        routes = payload.get("routes", []) or []
+        sockets = payload.get("sockets", []) or []
+        neighbors = payload.get("neighbors", []) or []
         aps = payload.get("aps", []) or []
         hosts = payload.get("hosts", []) or []
+        errors = payload.get("errors", []) or []
 
         def set_row(table: QTableWidget, r: int, c: int, value: str) -> None:
             item = QTableWidgetItem(value)
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(r, c, item)
 
+        def get_value(item, attr, default=""):
+            if isinstance(item, dict):
+                return item.get(attr, default)
+            return getattr(item, attr, default)
+
         self.iface_table.setRowCount(len(interfaces))
         for r, it in enumerate(interfaces):
-            set_row(self.iface_table, r, 0, str(it.get("name", "")))
-            set_row(self.iface_table, r, 1, str(it.get("state", "")))
-            set_row(self.iface_table, r, 2, str(it.get("mac", "")))
-            ipv4 = it.get("ipv4") or []
-            ipv6 = it.get("ipv6") or []
+            set_row(self.iface_table, r, 0, str(get_value(it, "name", "")))
+            set_row(self.iface_table, r, 1, str(get_value(it, "state", "")))
+            set_row(self.iface_table, r, 2, str(get_value(it, "mac", "")))
+            ipv4 = get_value(it, "ipv4", []) or []
+            ipv6 = get_value(it, "ipv6", []) or []
             set_row(self.iface_table, r, 3, ", ".join(ipv4) if isinstance(ipv4, list) else str(ipv4))
             set_row(self.iface_table, r, 4, ", ".join(ipv6) if isinstance(ipv6, list) else str(ipv6))
+            set_row(self.iface_table, r, 5, str(get_value(it, "speed", "")))
+
+        self.route_table.setRowCount(len(routes))
+        for r, route in enumerate(routes):
+            set_row(self.route_table, r, 0, str(get_value(route, "destination", "")))
+            set_row(self.route_table, r, 1, str(get_value(route, "gateway", "")))
+            set_row(self.route_table, r, 2, str(get_value(route, "interface", "")))
+            set_row(self.route_table, r, 3, str(get_value(route, "metric", "")))
+
+        self.socket_table.setRowCount(len(sockets))
+        for r, sock in enumerate(sockets):
+            local = f"{get_value(sock, 'local_address', '')}:{get_value(sock, 'local_port', '')}"
+            remote = f"{get_value(sock, 'remote_address', '')}:{get_value(sock, 'remote_port', '')}"
+            set_row(self.socket_table, r, 0, str(get_value(sock, "proto", "")))
+            set_row(self.socket_table, r, 1, local)
+            set_row(self.socket_table, r, 2, remote)
+            set_row(self.socket_table, r, 3, str(get_value(sock, "state", "")))
+            set_row(self.socket_table, r, 4, str(get_value(sock, "pid", "")))
+            set_row(self.socket_table, r, 5, str(get_value(sock, "process", "")))
+
+        self.neighbor_table.setRowCount(len(neighbors))
+        for r, neighbor in enumerate(neighbors):
+            set_row(self.neighbor_table, r, 0, str(get_value(neighbor, "ip", "")))
+            set_row(self.neighbor_table, r, 1, str(get_value(neighbor, "mac", "")))
+            set_row(self.neighbor_table, r, 2, str(get_value(neighbor, "state", "")))
+            set_row(self.neighbor_table, r, 3, str(get_value(neighbor, "interface", "")))
 
         self.ap_table.setRowCount(len(aps))
         for r, ap in enumerate(aps):
-            set_row(self.ap_table, r, 0, str(ap.get("ssid", "")))
-            set_row(self.ap_table, r, 1, str(ap.get("bssid", "")))
-            set_row(self.ap_table, r, 2, str(ap.get("chan", "")))
-            set_row(self.ap_table, r, 3, f"{ap.get('signal', '')}%")
-            set_row(self.ap_table, r, 4, str(ap.get("security", "")))
+            set_row(self.ap_table, r, 0, str(get_value(ap, "ssid", "")))
+            set_row(self.ap_table, r, 1, str(get_value(ap, "bssid", "")))
+            set_row(self.ap_table, r, 2, str(get_value(ap, "channel", "")))
+            set_row(self.ap_table, r, 3, str(get_value(ap, "signal", "")))
+            set_row(self.ap_table, r, 4, str(get_value(ap, "security", "")))
 
         self.host_table.setRowCount(len(hosts))
         for r, h in enumerate(hosts):
-            set_row(self.host_table, r, 0, str(h.get("ip", "")))
-            set_row(self.host_table, r, 1, str(h.get("mac", "")))
-            set_row(self.host_table, r, 2, str(h.get("state", "")))
+            set_row(self.host_table, r, 0, str(get_value(h, "ip", "")))
+            set_row(self.host_table, r, 1, str(get_value(h, "mac", "")))
+            set_row(self.host_table, r, 2, str(get_value(h, "state", "")))
+            set_row(self.host_table, r, 3, str(get_value(h, "source", "")))
 
         if self.holo_view is not None:
             try:
-                js = "window.netNinjaUpdate(%s);" % json.dumps({"interfaces": interfaces, "aps": aps, "hosts": hosts}, ensure_ascii=False)
+                iface_payload = [
+                    {
+                        "name": get_value(it, "name", ""),
+                        "state": get_value(it, "state", ""),
+                        "mac": get_value(it, "mac", ""),
+                        "ipv4": get_value(it, "ipv4", []),
+                        "ipv6": get_value(it, "ipv6", []),
+                    }
+                    for it in interfaces
+                ]
+                ap_payload = [
+                    {
+                        "ssid": get_value(ap, "ssid", ""),
+                        "bssid": get_value(ap, "bssid", ""),
+                        "chan": get_value(ap, "channel", ""),
+                        "signal": get_value(ap, "signal", ""),
+                        "security": get_value(ap, "security", ""),
+                    }
+                    for ap in aps
+                ]
+                host_payload = [
+                    {
+                        "ip": get_value(h, "ip", ""),
+                        "mac": get_value(h, "mac", ""),
+                        "state": get_value(h, "state", ""),
+                    }
+                    for h in hosts
+                ]
+                js = "window.netNinjaUpdate(%s);" % json.dumps(
+                    {"interfaces": iface_payload, "aps": ap_payload, "hosts": host_payload},
+                    ensure_ascii=False,
+                )
                 self.holo_view.page().runJavaScript(js)
-            except Exception:
-                pass
+            except Exception as exc:
+                if self.main_window:
+                    self.main_window._append_log_line(f"[discovery] Map update failed: {exc}")
+
+        if errors and self.main_window:
+            for err in errors:
+                self.main_window._append_log_line(f"[discovery] {err}")
 
 
     def build_genome_group(self) -> QWidget:
@@ -919,7 +889,9 @@ class ScanTab(CategoryTab):
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(list(self.scan_presets.keys()))
         layout.addWidget(self.preset_combo)
-        layout.addWidget(create_glowing_button("Initiate Sequencing", self.run_selected_preset))
+        initiate_btn = create_glowing_button("Initiate Sequencing", self.run_selected_preset)
+        self.main_window.guard_button(initiate_btn, required_tools=["nmap"])
+        layout.addWidget(initiate_btn)
         layout.addStretch()
         return container
 
@@ -930,21 +902,27 @@ class ScanTab(CategoryTab):
 
         grid.addWidget(QLabel("Initiate genome sequencing across common vectors."), 0, 0, 1, 2)
         quick_button = create_glowing_button("Rapid Sequencing (nmap -T4 -F)", self.run_quick)
+        self.main_window.guard_button(quick_button, required_tools=["nmap"])
         grid.addWidget(quick_button, 1, 0)
 
         full_button = create_glowing_button("Full Genome Scan (-sS -sV -A -p-)", self.run_full)
+        self.main_window.guard_button(full_button, required_tools=["nmap"], require_admin=True)
         grid.addWidget(full_button, 1, 1)
 
         stealth_button = create_glowing_button("Stealth Vector (-sS -T2 -f)", self.run_stealth)
+        self.main_window.guard_button(stealth_button, required_tools=["nmap"], require_admin=True)
         grid.addWidget(stealth_button, 2, 0)
 
         udp_button = create_glowing_button("UDP Vector Scan (--top-ports 100)", self.run_udp)
+        self.main_window.guard_button(udp_button, required_tools=["nmap"], require_admin=True)
         grid.addWidget(udp_button, 2, 1)
 
         vuln_button = create_glowing_button("Vulnerability Assay (--script vuln)", self.run_vuln)
+        self.main_window.guard_button(vuln_button, required_tools=["nmap"])
         grid.addWidget(vuln_button, 3, 0)
 
         service_button = create_glowing_button("Service Fingerprinting (-sV)", self.run_service)
+        self.main_window.guard_button(service_button, required_tools=["nmap"])
         grid.addWidget(service_button, 3, 1)
 
         return container
@@ -957,9 +935,11 @@ class ScanTab(CategoryTab):
         layout.addWidget(QLabel("Specialized scans"), 0, 0, 1, 2)
 
         masscan_btn = create_glowing_button("Masscan (fast ports)", self.run_masscan)
+        self.main_window.guard_button(masscan_btn, required_tools=["masscan"], require_admin=True)
         layout.addWidget(masscan_btn, 1, 0)
 
         rustscan_btn = create_glowing_button("Rustscan + nmap", self.run_rustscan)
+        self.main_window.guard_button(rustscan_btn, required_tools=["rustscan"])
         layout.addWidget(rustscan_btn, 1, 1)
         return container
 
@@ -1023,7 +1003,8 @@ class ScanTab(CategoryTab):
         if not target:
             return
         if not self.require_authorization("Masscan sweep"):
-            self.output_log.appendPlainText("[info] Masscan cancelled (authorization phrase not provided)")
+            if self.main_window:
+                self.main_window._append_log_line("[info] Masscan cancelled (authorization phrase not provided)")
             return
         cmd = f"sudo masscan -p1-65535 {quote(target)} --rate 10000"
         self.executor(cmd, "Masscan sweep", target=target)
@@ -1042,6 +1023,8 @@ class ReconTab(CategoryTab):
     def __init__(self, executor, main_window):
         super().__init__(executor, main_window)
         self.target_field = TargetField("Subnet/host")
+        self.target_field.scan_requested.connect(lambda field: self.main_window.scan_targets_for_field(field))
+        self.main_window.guard_button(self.target_field.scan_btn, feature_flag="can_list_interfaces")
         main_window.register_target_field(self.target_field)
         target_wrap = QWidget()
         target_layout = QVBoxLayout(target_wrap)
@@ -1073,6 +1056,8 @@ class ReconTab(CategoryTab):
             button = create_glowing_button(
                 label, lambda template=template, desc=desc: self.run_discovery(template, desc)
             )
+            required = self.main_window._infer_required_tools(template)
+            self.main_window.guard_button(button, required_tools=required, require_admin=template.strip().startswith("sudo"))
             btn_layout.addWidget(button, idx // 2, idx % 2)
 
         group.layout().addLayout(btn_layout)
@@ -1081,9 +1066,12 @@ class ReconTab(CategoryTab):
         self.discovery_combo = QComboBox()
         self.discovery_combo.addItems([label for label, *_ in self.discovery_options])
         drop_layout.addWidget(self.discovery_combo)
-        drop_layout.addWidget(create_glowing_button("Execute", self.run_discovery_dropdown))
+        self.discovery_exec_button = create_glowing_button("Execute", self.run_discovery_dropdown)
+        drop_layout.addWidget(self.discovery_exec_button)
         drop_layout.addStretch()
         group.layout().addLayout(drop_layout)
+        self.discovery_combo.currentIndexChanged.connect(self._update_discovery_exec_state)
+        self._update_discovery_exec_state()
         return group
 
     def create_enum_group(self) -> QGroupBox:
@@ -1094,6 +1082,8 @@ class ReconTab(CategoryTab):
             button = create_glowing_button(
                 label, lambda template=template, desc=desc: self.run_enum(template, desc)
             )
+            required = self.main_window._infer_required_tools(template)
+            self.main_window.guard_button(button, required_tools=required, require_admin=template.strip().startswith("sudo"))
             layout.addWidget(button, idx // 2, idx % 2)
 
         group.layout().addLayout(layout)
@@ -1102,9 +1092,12 @@ class ReconTab(CategoryTab):
         self.enum_combo = QComboBox()
         self.enum_combo.addItems([label for label, *_ in self.enum_options])
         drop_layout.addWidget(self.enum_combo)
-        drop_layout.addWidget(create_glowing_button("Run", self.run_enum_dropdown))
+        self.enum_exec_button = create_glowing_button("Run", self.run_enum_dropdown)
+        drop_layout.addWidget(self.enum_exec_button)
         drop_layout.addStretch()
         group.layout().addLayout(drop_layout)
+        self.enum_combo.currentIndexChanged.connect(self._update_enum_exec_state)
+        self._update_enum_exec_state()
         return group
 
     def run_discovery(self, template: str, description: str) -> None:
@@ -1137,6 +1130,56 @@ class ReconTab(CategoryTab):
         _, template, desc = self.enum_options[idx]
         self.run_enum(template, desc)
 
+    def _update_discovery_exec_state(self) -> None:
+        idx = self.discovery_combo.currentIndex()
+        if idx < 0:
+            self.discovery_exec_button.setEnabled(False)
+            return
+        _, template, _ = self.discovery_options[idx]
+        required = self.main_window._infer_required_tools(template)
+        require_admin = template.strip().startswith("sudo")
+        allowed = True
+        reason = ""
+        for tool in required:
+            if not (self.main_window.capabilities.tools.get(tool, False) or shutil.which(tool)):
+                if self.main_window.capabilities.is_windows and self.main_window.capabilities.tools.get("wsl", False):
+                    reason = f"Requires WSL tool: {tool}"
+                    continue
+                allowed = False
+                reason = f"Missing tool: {tool}"
+                break
+        if require_admin and not self.main_window.capabilities.is_admin:
+            allowed = False
+            reason = "Requires administrator/root privileges"
+        self.discovery_exec_button.setEnabled(allowed)
+        if reason:
+            self.discovery_exec_button.setToolTip(reason)
+
+    def _update_enum_exec_state(self) -> None:
+        idx = self.enum_combo.currentIndex()
+        if idx < 0:
+            self.enum_exec_button.setEnabled(False)
+            return
+        _, template, _ = self.enum_options[idx]
+        required = self.main_window._infer_required_tools(template)
+        require_admin = template.strip().startswith("sudo")
+        allowed = True
+        reason = ""
+        for tool in required:
+            if not (self.main_window.capabilities.tools.get(tool, False) or shutil.which(tool)):
+                if self.main_window.capabilities.is_windows and self.main_window.capabilities.tools.get("wsl", False):
+                    reason = f"Requires WSL tool: {tool}"
+                    continue
+                allowed = False
+                reason = f"Missing tool: {tool}"
+                break
+        if require_admin and not self.main_window.capabilities.is_admin:
+            allowed = False
+            reason = "Requires administrator/root privileges"
+        self.enum_exec_button.setEnabled(allowed)
+        if reason:
+            self.enum_exec_button.setToolTip(reason)
+
 
 class WirelessTab(CategoryTab):
     """WIRELESS tab for interface control, reconnaissance, and cracking."""
@@ -1145,8 +1188,14 @@ class WirelessTab(CategoryTab):
         super().__init__(executor, main_window)
         self.executor = executor
         self.iface_field = TargetField("Wireless interface", share_history=False)
+        self.iface_field.scan_btn.setText("Refresh Interfaces")
+        self.iface_field.scan_requested.connect(lambda _field: self.refresh_interfaces())
+        self.main_window.guard_button(self.iface_field.scan_btn, feature_flag="can_list_interfaces")
         main_window.register_target_field(self.iface_field)
         self.bssid_field = TargetField("Target BSSID", share_history=True)
+        self.bssid_field.scan_btn.setText("Scan Wi-Fi")
+        self.bssid_field.scan_requested.connect(lambda _field: self.refresh_bssids())
+        self.main_window.guard_button(self.bssid_field.scan_btn, feature_flag="can_scan_wifi")
         # Register BSSID field with the main window for shared history
         if main_window:
             main_window.register_bssid_field(self.bssid_field)
@@ -1180,6 +1229,9 @@ class WirelessTab(CategoryTab):
         enable_btn = create_glowing_button("Enable monitor mode", self.enable_monitor)
         disable_btn = create_glowing_button("Disable monitor mode", self.disable_monitor)
         refresh_btn = create_glowing_button("Refresh interfaces", self.refresh_interfaces)
+        self.main_window.guard_button(enable_btn, required_tools=["airmon-ng"], require_admin=True)
+        self.main_window.guard_button(disable_btn, required_tools=["airmon-ng"], require_admin=True)
+        self.main_window.guard_button(refresh_btn, feature_flag="can_list_interfaces")
         layout.addWidget(enable_btn, 0, 0)
         layout.addWidget(disable_btn, 0, 1)
         layout.addWidget(refresh_btn, 1, 0, 1, 2)
@@ -1194,6 +1246,9 @@ class WirelessTab(CategoryTab):
         airodump = create_glowing_button("Run airodump-ng (10s)", self.run_airodump)
         bettercap = create_glowing_button("Bettercap capture", self.run_bettercap)
         wifite = create_glowing_button("Start wifite (auto)", self.run_wifite)
+        self.main_window.guard_button(airodump, required_tools=["airodump-ng"], require_admin=True)
+        self.main_window.guard_button(bettercap, required_tools=["bettercap"], require_admin=True)
+        self.main_window.guard_button(wifite, required_tools=["wifite"], require_admin=True)
         layout.addWidget(airodump, 0, 0)
         layout.addWidget(bettercap, 0, 1)
         layout.addWidget(wifite, 1, 0, 1, 2)
@@ -1208,6 +1263,9 @@ class WirelessTab(CategoryTab):
         deauth_btn = create_glowing_button("Deauth attack", self.deauth_attack)
         wps_btn = create_glowing_button("WPS attack (reaver)", self.wps_attack)
         handshake_btn = create_glowing_button("Capture handshake", self.capture_handshake)
+        self.main_window.guard_button(deauth_btn, required_tools=["aireplay-ng"], require_admin=True)
+        self.main_window.guard_button(wps_btn, required_tools=["reaver"], require_admin=True)
+        self.main_window.guard_button(handshake_btn, required_tools=["airodump-ng"], require_admin=True)
         layout.addWidget(deauth_btn, 0, 0)
         layout.addWidget(wps_btn, 0, 1)
         layout.addWidget(handshake_btn, 1, 0, 1, 2)
@@ -1215,9 +1273,12 @@ class WirelessTab(CategoryTab):
         drop_layout = QHBoxLayout()
         drop_layout.addWidget(QLabel("Attack preset"))
         drop_layout.addWidget(self.attack_combo)
-        drop_layout.addWidget(create_glowing_button("Launch attack", self.run_selected_wireless_attack))
+        self.attack_exec_button = create_glowing_button("Launch attack", self.run_selected_wireless_attack)
+        drop_layout.addWidget(self.attack_exec_button)
         drop_layout.addStretch()
         group.layout().addLayout(drop_layout)
+        self.attack_combo.currentIndexChanged.connect(self._update_attack_exec_state)
+        self._update_attack_exec_state()
         return group
 
     def build_cracking_group(self) -> QGroupBox:
@@ -1227,7 +1288,10 @@ class WirelessTab(CategoryTab):
         layout.setVerticalSpacing(6)
         aircrack_btn = create_glowing_button("Crack with aircrack-ng", self.run_aircrack)
         hashcat_btn = create_glowing_button("Crack with hashcat", self.run_hashcat)
-        convert_btn = create_glowing_button("Convert .cap → .hc22000", self.convert_handshake)
+        convert_btn = create_glowing_button("Convert .cap -> .hc22000", self.convert_handshake)
+        self.main_window.guard_button(aircrack_btn, required_tools=["aircrack-ng"])
+        self.main_window.guard_button(hashcat_btn, required_tools=["hashcat"])
+        self.main_window.guard_button(convert_btn, required_tools=["hcxpcapngtool"])
         layout.addWidget(aircrack_btn, 0, 0)
         layout.addWidget(hashcat_btn, 0, 1)
         layout.addWidget(convert_btn, 1, 0, 1, 2)
@@ -1242,31 +1306,78 @@ class WirelessTab(CategoryTab):
         return value
 
     def refresh_interfaces(self) -> None:
-        """Populate the interface selector with available wireless or network interfaces."""
-        # SECURITY FIX: Avoid shell=True by using a proper pipeline
-        try:
-            p1 = subprocess.Popen(["iw", "dev"], stdout=subprocess.PIPE)
-            p2 = subprocess.Popen(["awk", "/Interface/ {print $2}"], stdin=p1.stdout, stdout=subprocess.PIPE, text=True)
-            p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
-            output, _ = p2.communicate()
-            interfaces = [line.strip() for line in output.splitlines() if line.strip()]
-        except (FileNotFoundError, Exception):
-            interfaces = []
+        """Populate the interface selector using the provider."""
+        def precheck() -> tuple[bool, str, str]:
+            if not self.main_window.capabilities.flag("can_list_interfaces"):
+                reason = self.main_window.capabilities.reason("can_list_interfaces") or "Interface discovery unavailable"
+                return False, reason, "Install required tools or run with elevated privileges."
+            return True, "", ""
 
-        # Fallback: enumerate all network interfaces if none found
-        if not interfaces:
-            try:
-                candidates = os.listdir('/sys/class/net')
-                interfaces = [iface for iface in candidates if iface != 'lo']
-            except Exception:
-                interfaces = []
-        
-        self.iface_field.combo.clear()
-        if interfaces:
-            self.iface_field.combo.addItems(interfaces)
-        summary = ", ".join(interfaces) if interfaces else "no network interfaces detected"
-        if self.main_window:
-            self.main_window.output_log.appendPlainText(f"[info] Interfaces refreshed: {summary}")
+        def execute() -> ExecutionResult:
+            start = time.time()
+            interfaces = self.main_window.provider.get_interfaces()
+            return ExecutionResult(returncode=0, payload={"interfaces": interfaces}, elapsed=time.time() - start)
+
+        def parse(result: ExecutionResult) -> Dict[str, Any]:
+            interfaces = result.payload.get("interfaces", [])
+            names = [getattr(it, "name", "") if not isinstance(it, dict) else it.get("name", "") for it in interfaces]
+            summary = {"interfaces": len([n for n in names if n])}
+            return {"summary": summary, "items": [], "names": [n for n in names if n]}
+
+        def ui_update(payload: Dict[str, Any]) -> None:
+            names = payload.get("names", [])
+            self.iface_field.combo.clear()
+            if names:
+                self.iface_field.combo.addItems(names)
+            summary = ", ".join(names) if names else "no interfaces detected"
+            self.main_window._append_log_line(f"[wireless] Interfaces refreshed: {summary}")
+
+        job = JobSpec(
+            name="Refresh Interfaces",
+            category="wireless",
+            precheck=precheck,
+            execute=execute,
+            parse=parse,
+            ui_update=ui_update,
+        )
+        self.run_job(job)
+
+    def refresh_bssids(self) -> None:
+        """Populate the BSSID selector from a Wi-Fi scan."""
+        def precheck() -> tuple[bool, str, str]:
+            if not self.main_window.capabilities.flag("can_scan_wifi"):
+                reason = self.main_window.capabilities.reason("can_scan_wifi") or "Wi-Fi scan unavailable"
+                return False, reason, "Install required tools or run with elevated privileges."
+            return True, "", ""
+
+        def execute() -> ExecutionResult:
+            start = time.time()
+            aps = self.main_window.provider.scan_wifi()
+            return ExecutionResult(returncode=0, payload={"aps": aps}, elapsed=time.time() - start)
+
+        def parse(result: ExecutionResult) -> Dict[str, Any]:
+            aps = result.payload.get("aps", [])
+            bssids = [getattr(ap, "bssid", "") if not isinstance(ap, dict) else ap.get("bssid", "") for ap in aps]
+            summary = {"bssids": len([b for b in bssids if b])}
+            return {"summary": summary, "items": [], "bssids": [b for b in bssids if b]}
+
+        def ui_update(payload: Dict[str, Any]) -> None:
+            bssids = payload.get("bssids", [])
+            self.bssid_field.combo.clear()
+            if bssids:
+                self.bssid_field.combo.addItems(bssids)
+            summary = ", ".join(bssids) if bssids else "no BSSIDs detected"
+            self.main_window._append_log_line(f"[wireless] BSSIDs refreshed: {summary}")
+
+        job = JobSpec(
+            name="Scan Wi-Fi",
+            category="wireless",
+            precheck=precheck,
+            execute=execute,
+            parse=parse,
+            ui_update=ui_update,
+        )
+        self.run_job(job)
 
     def enable_monitor(self) -> None:
         iface = self.iface()
@@ -1309,7 +1420,8 @@ class WirelessTab(CategoryTab):
             return
         target = self.bssid_field.value() or "FF:FF:FF:FF:FF:FF"
         if not self.require_authorization("Deauth attack"):
-            self.output_log.appendPlainText("[info] Deauth attack cancelled (authorization phrase not provided)")
+            if self.main_window:
+                self.main_window._append_log_line("[info] Deauth attack cancelled (authorization phrase not provided)")
             return
         if self.main_window and self.bssid_field.value():
             self.main_window.add_bssid_history(self.bssid_field.value())
@@ -1325,7 +1437,8 @@ class WirelessTab(CategoryTab):
             QMessageBox.warning(self, "BSSID required", "Provide a target BSSID for WPS attacks.")
             return
         if not self.require_authorization("WPS attack"):
-            self.output_log.appendPlainText("[info] WPS attack cancelled (authorization phrase not provided)")
+            if self.main_window:
+                self.main_window._append_log_line("[info] WPS attack cancelled (authorization phrase not provided)")
             return
         if self.main_window:
             self.main_window.add_bssid_history(target)
@@ -1343,7 +1456,8 @@ class WirelessTab(CategoryTab):
             QMessageBox.warning(self, "BSSID missing", "Provide the target BSSID for capture.")
             return
         if not self.require_authorization("Handshake capture"):
-            self.output_log.appendPlainText("[info] Handshake capture cancelled (authorization phrase not provided)")
+            if self.main_window:
+                self.main_window._append_log_line("[info] Handshake capture cancelled (authorization phrase not provided)")
             return
         if self.main_window:
             self.main_window.add_bssid_history(target)
@@ -1384,6 +1498,27 @@ class WirelessTab(CategoryTab):
         elif choice == "Handshake capture":
             self.capture_handshake()
 
+    def _update_attack_exec_state(self) -> None:
+        choice = self.attack_combo.currentText()
+        tool = ""
+        if choice == "Deauth attack":
+            tool = "aireplay-ng"
+        elif choice == "WPS attack (reaver)":
+            tool = "reaver"
+        elif choice == "Handshake capture":
+            tool = "airodump-ng"
+        allowed = True
+        reason = ""
+        if tool and not (self.main_window.capabilities.tools.get(tool, False) or shutil.which(tool)):
+            allowed = False
+            reason = f"Missing tool: {tool}"
+        if not self.main_window.capabilities.is_admin:
+            allowed = False
+            reason = "Requires administrator/root privileges"
+        self.attack_exec_button.setEnabled(allowed)
+        if not allowed:
+            self.attack_exec_button.setToolTip(reason)
+
     def request_input(self, prompt: str, default: str = "") -> Tuple[str, bool]:
         value, ok = QInputDialog.getText(self, "Input required", prompt, text=default)
         return value, ok
@@ -1395,6 +1530,8 @@ class WebTab(CategoryTab):
     def __init__(self, executor, main_window):
         super().__init__(executor, main_window)
         self.target_field = TargetField("URL / Domain")
+        self.target_field.scan_requested.connect(lambda field: self.main_window.scan_targets_for_field(field))
+        self.main_window.guard_button(self.target_field.scan_btn, feature_flag="can_list_interfaces")
         main_window.register_target_field(self.target_field)
         target_wrap = QWidget()
         target_layout = QVBoxLayout(target_wrap)
@@ -1422,6 +1559,8 @@ class WebTab(CategoryTab):
 
         for idx, (label, template, desc) in enumerate(self.web_scanners):
             button = create_glowing_button(label, lambda t=template, d=desc: self.run_web_tool(t, d))
+            required = self.main_window._infer_required_tools(template)
+            self.main_window.guard_button(button, required_tools=required)
             layout.addWidget(button, idx // 2, idx % 2)
 
         group.layout().addLayout(layout)
@@ -1430,9 +1569,12 @@ class WebTab(CategoryTab):
         self.web_combo = QComboBox()
         self.web_combo.addItems([label for label, *_ in self.web_scanners])
         drop_layout.addWidget(self.web_combo)
-        drop_layout.addWidget(create_glowing_button("Launch", self.run_web_combo))
+        self.web_exec_button = create_glowing_button("Launch", self.run_web_combo)
+        drop_layout.addWidget(self.web_exec_button)
         drop_layout.addStretch()
         group.layout().addLayout(drop_layout)
+        self.web_combo.currentIndexChanged.connect(self._update_web_exec_state)
+        self._update_web_exec_state()
         return group
 
     def build_directory_group(self) -> QGroupBox:
@@ -1442,6 +1584,8 @@ class WebTab(CategoryTab):
         layout.setVerticalSpacing(6)
         for idx, (label, template) in enumerate(self.dir_tools):
             button = create_glowing_button(label, lambda t=template: self.run_dir_tool(t))
+            required = self.main_window._infer_required_tools(template)
+            self.main_window.guard_button(button, required_tools=required)
             layout.addWidget(button, idx // 2, idx % 2)
         group.layout().addLayout(layout)
         drop_layout = QHBoxLayout()
@@ -1449,9 +1593,12 @@ class WebTab(CategoryTab):
         self.dir_combo = QComboBox()
         self.dir_combo.addItems([label for label, *_ in self.dir_tools])
         drop_layout.addWidget(self.dir_combo)
-        drop_layout.addWidget(create_glowing_button("Start", self.run_dir_combo))
+        self.dir_exec_button = create_glowing_button("Start", self.run_dir_combo)
+        drop_layout.addWidget(self.dir_exec_button)
         drop_layout.addStretch()
         group.layout().addLayout(drop_layout)
+        self.dir_combo.currentIndexChanged.connect(self._update_dir_exec_state)
+        self._update_dir_exec_state()
         return group
 
     def run_web_tool(self, template: str, description: str) -> None:
@@ -1484,12 +1631,129 @@ class WebTab(CategoryTab):
         _, template = self.dir_tools[idx]
         self.run_dir_tool(template)
 
+    def _update_web_exec_state(self) -> None:
+        idx = self.web_combo.currentIndex()
+        if idx < 0:
+            self.web_exec_button.setEnabled(False)
+            return
+        _, template, _ = self.web_scanners[idx]
+        required = self.main_window._infer_required_tools(template)
+        allowed = True
+        reason = ""
+        for tool in required:
+            if not (self.main_window.capabilities.tools.get(tool, False) or shutil.which(tool)):
+                if self.main_window.capabilities.is_windows and self.main_window.capabilities.tools.get("wsl", False):
+                    reason = f"Requires WSL tool: {tool}"
+                    continue
+                allowed = False
+                reason = f"Missing tool: {tool}"
+                break
+        self.web_exec_button.setEnabled(allowed)
+        if reason:
+            self.web_exec_button.setToolTip(reason)
+
+    def _update_dir_exec_state(self) -> None:
+        idx = self.dir_combo.currentIndex()
+        if idx < 0:
+            self.dir_exec_button.setEnabled(False)
+            return
+        _, template = self.dir_tools[idx]
+        required = self.main_window._infer_required_tools(template)
+        allowed = True
+        reason = ""
+        for tool in required:
+            if not (self.main_window.capabilities.tools.get(tool, False) or shutil.which(tool)):
+                if self.main_window.capabilities.is_windows and self.main_window.capabilities.tools.get("wsl", False):
+                    reason = f"Requires WSL tool: {tool}"
+                    continue
+                allowed = False
+                reason = f"Missing tool: {tool}"
+                break
+        self.dir_exec_button.setEnabled(allowed)
+        if reason:
+            self.dir_exec_button.setToolTip(reason)
+
+
+class ToolsTab(CategoryTab):
+    """TOOLS tab for system and network utilities."""
+
+    def __init__(self, executor, main_window):
+        super().__init__(executor, main_window)
+        self.main_window = main_window
+        self.add_panel("System Tools", self.build_system_tools())
+        self.add_panel("Network Tools", self.build_network_tools())
+
+    def build_system_tools(self) -> QGroupBox:
+        group = self.add_group("System Tools", "System information and diagnostics.")
+        layout = QGridLayout()
+
+        if self.main_window.capabilities.is_windows:
+            tools = [
+                ("System Info", "systeminfo", "System info"),
+                ("Task List", "tasklist", "Task list"),
+                ("Network Stats", "netstat -ano", "Network stats"),
+                ("IP Config", "ipconfig /all", "IP config"),
+            ]
+        else:
+            tools = [
+                ("System Info", "uname -a", "System info"),
+                ("Task List", "ps -eo pid,comm,pcpu,pmem --sort=-pcpu", "Task list"),
+                ("Network Stats", "ss -s", "Network stats"),
+                ("IP Config", "ip addr", "IP config"),
+            ]
+
+        for idx, (label, cmd, desc) in enumerate(tools):
+            btn = create_glowing_button(label, lambda c=cmd, d=desc: self.executor(c, d))
+            required = self.main_window._infer_required_tools(cmd)
+            self.main_window.guard_button(btn, required_tools=required)
+            layout.addWidget(btn, idx // 2, idx % 2)
+
+        group.layout().addLayout(layout)
+        return group
+
+    def build_network_tools(self) -> QGroupBox:
+        group = self.add_group("Network Tools", "Network diagnostics and testing.")
+        layout = QGridLayout()
+
+        if self.main_window.capabilities.is_windows:
+            tools = [
+                ("Route Table", "route print", "Route table"),
+                ("ARP Table", "arp -a", "ARP table"),
+                ("DNS Cache", "ipconfig /displaydns", "DNS cache"),
+                ("Firewall Status", "netsh advfirewall show allprofiles", "Firewall status"),
+            ]
+        else:
+            firewall_cmd = "ufw status" if shutil.which("ufw") else "iptables -S"
+            tools = [
+                ("Route Table", "ip route", "Route table"),
+                ("ARP Table", "ip neigh", "ARP table"),
+                ("DNS Cache", "resolvectl statistics", "DNS cache"),
+                ("Firewall Status", firewall_cmd, "Firewall status"),
+            ]
+
+        for idx, (label, cmd, desc) in enumerate(tools):
+            btn = create_glowing_button(label, lambda c=cmd, d=desc: self.executor(c, d))
+            required = self.main_window._infer_required_tools(cmd)
+            require_admin = cmd.startswith("iptables")
+            self.main_window.guard_button(btn, required_tools=required, require_admin=require_admin)
+            layout.addWidget(btn, idx // 2, idx % 2)
+
+        group.layout().addLayout(layout)
+        return group
+
 
 class NetReaperGui(QWidget):
     """Main container that stitches tabs, logs, and history."""
 
     def __init__(self):
         super().__init__()
+        self.capabilities = detect_capabilities()
+        self.provider = get_provider(self.capabilities)
+        self.job_manager = JobManager(self._append_log_line)
+        self.job_manager.event_emitted.connect(self._handle_job_event)
+        self.job_manager.result_emitted.connect(self._handle_job_result)
+        self.active_jobs: set[str] = set()
+        self._active_processes: Dict[str, subprocess.Popen] = {}
         self.setWindowTitle("NetReaper Command Center")
         self.setMinimumSize(1200, 720)
         self.session_id = uuid4().hex[:8].upper()
@@ -1498,7 +1762,7 @@ class NetReaperGui(QWidget):
         self.target_history: List[str] = []
         self.bssid_fields: List[TargetField] = []
         self.bssid_history: List[str] = []
-        self.active_threads: List[CommandThread] = []
+        self.active_jobs: set[str] = set()
         self.wiring_flags = {}
         self.lite_mode = False
         self.custom_wordlist = ""
@@ -1506,6 +1770,17 @@ class NetReaperGui(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
+
+        # Menu bar
+        self.menu_bar = QMenuBar()
+        diagnostics_menu = self.menu_bar.addMenu("Diagnostics")
+        self.self_test_action = QAction("Run Self Test", self)
+        self.self_test_action.triggered.connect(self.run_self_test)
+        diagnostics_menu.addAction(self.self_test_action)
+        self.save_diag_action = QAction("Save Diagnostics", self)
+        self.save_diag_action.triggered.connect(self.save_diagnostics)
+        diagnostics_menu.addAction(self.save_diag_action)
+        main_layout.addWidget(self.menu_bar)
 
         # Toolbar
         self.toolbar = QToolBar("Actions")
@@ -1516,6 +1791,9 @@ class NetReaperGui(QWidget):
         self.toolbar.addSeparator()
         refresh_status_action = QAction("Show status", self)
         refresh_status_action.triggered.connect(lambda: self.execute_command("netreaper status", "Status"))
+        if not (shutil.which("netreaper") or self.capabilities.tools.get("netreaper", False)):
+            refresh_status_action.setEnabled(False)
+            refresh_status_action.setToolTip("Missing tool: netreaper")
         self.toolbar.addAction(refresh_status_action)
 
         stop_action = QAction("Stop tasks", self)
@@ -1576,17 +1854,19 @@ class NetReaperGui(QWidget):
         self.recon_tab = ReconTab(self.execute_command, self)
         self.wireless_tab = WirelessTab(self.execute_command, self)
         self.web_tab = WebTab(self.execute_command, self)
+        self.tools_tab = ToolsTab(self.execute_command, self)
         self.wizard_tab = WizardTab(self.execute_command, self)
-        self.jobs_tab = JobsTab(self)
+        self.jobs_tab = JobsTab(self.job_manager, self.save_diagnostics, self.run_self_test, self)
 
         wizard_page = self._wrap_in_workspace("Automation Wizards", self.wizard_tab)
-        jobs_page = self._wrap_in_workspace("Containment Logs", self.jobs_tab)
+        jobs_page = self._wrap_in_workspace("Diagnostics & Jobs", self.jobs_tab)
 
         self.pages = [
             ("Scan", self.scan_tab),
             ("Recon", self.recon_tab),
             ("Wireless", self.wireless_tab),
             ("Web", self.web_tab),
+            ("Tools", self.tools_tab),
             ("Wizards", wizard_page),
             ("Jobs", jobs_page),
         ]
@@ -1605,6 +1885,7 @@ class NetReaperGui(QWidget):
         self.reaper_header.add_nav_button("Recon", lambda: self.navigate_to("Recon"))
         self.reaper_header.add_nav_button("Wireless", lambda: self.navigate_to("Wireless"))
         self.reaper_header.add_nav_button("Web", lambda: self.navigate_to("Web"))
+        self.reaper_header.add_nav_button("Tools", lambda: self.navigate_to("Tools"))
         self.reaper_header.add_nav_button("Wizards", lambda: self.navigate_to("Wizards"))
         self.reaper_header.add_nav_button("Jobs", lambda: self.navigate_to("Jobs"))
 
@@ -1621,13 +1902,17 @@ class NetReaperGui(QWidget):
         self.hero_timer.timeout.connect(self.refresh_reaper_header)
         self.hero_timer.start(1000)
         self.refresh_reaper_header()
+        self._append_log_line(
+            f"[cap] Platform: {self.capabilities.platform} | Admin: {self.capabilities.is_admin} | WSL: {self.capabilities.tools.get('wsl', False)}"
+        )
+        self._append_log_line(f"[cap] Features: {', '.join(sorted([k for k, v in self.capabilities.feature_flags.items() if v]))}")
         self.run_ui_debug_checks()
 
     def build_operations_deck(self) -> QWidget:
         deck = QSplitter(Qt.Orientation.Horizontal)
         deck.setChildrenCollapsible(False)
 
-        self.output_panel = PanelWindow("Operations Console", "Live command output and controls")
+        self.output_panel = PanelWindow("Advanced Details", "Raw command output and controls")
         output_container = QWidget()
         output_layout = QVBoxLayout(output_container)
         output_layout.setContentsMargins(6, 6, 6, 6)
@@ -1695,6 +1980,7 @@ class NetReaperGui(QWidget):
         deck.setStretchFactor(1, 1)
         self.output_panel.set_status("#3dd598")
         self.history_panel.set_status("#3dd598")
+        self.output_panel.toggle_collapse()
         return deck
 
     def _wrap_in_workspace(self, title: str, widget: QWidget) -> QWidget:
@@ -1744,6 +2030,106 @@ class NetReaperGui(QWidget):
         for line in report:
             self.output_log.appendPlainText(line)
 
+    def _append_log_line(self, line: str) -> None:
+        if hasattr(self, "output_log") and self.output_log:
+            self.output_log.appendPlainText(line)
+
+    def _handle_job_event(self, event: Dict[str, Any]) -> None:
+        job_id = event.get("job_id", "")
+        event_type = event.get("type")
+        if event_type == "JOB_START":
+            if job_id:
+                self.active_jobs.add(job_id)
+            self.ingress_online = True
+        elif event_type in ("JOB_END", "JOB_FAIL"):
+            if job_id in self.active_jobs:
+                self.active_jobs.remove(job_id)
+            if not self.active_jobs:
+                self.ingress_online = False
+        elif event_type == "PRECHECK_FAIL":
+            detail = event.get("detail", {})
+            reason = detail.get("reason", "Action unavailable")
+            guidance = detail.get("guidance", "")
+            QMessageBox.warning(self, "Action unavailable", f"{reason}\n{guidance}".strip())
+        self.refresh_reaper_header()
+
+    def _handle_job_result(self, result: Dict[str, Any]) -> None:
+        status = result.get("status", "")
+        returncode = result.get("returncode", "")
+        self.output_status_label.setText(f"Status: {status} (code {returncode})")
+        color = "#3dd598" if status == "success" else "#ff7b7b"
+        if hasattr(self, "output_panel"):
+            self.output_panel.set_status(color)
+        if hasattr(self, "history_panel"):
+            self.history_panel.set_status(color)
+
+    def guard_button(
+        self,
+        button: QPushButton,
+        *,
+        required_tools: Optional[List[str]] = None,
+        require_admin: bool = False,
+        feature_flag: Optional[str] = None,
+        guidance: str = "",
+    ) -> None:
+        allowed = True
+        reason = ""
+        if feature_flag and not self.capabilities.flag(feature_flag):
+            allowed = False
+            reason = self.capabilities.reason(feature_flag) or "Capability not available"
+        if required_tools:
+            for tool in required_tools:
+                if not tool:
+                    continue
+                available = self.capabilities.tools.get(tool, False) or shutil.which(tool) is not None
+                if not available:
+                    if self.capabilities.is_windows and self.capabilities.tools.get("wsl", False):
+                        reason = f"Requires WSL tool: {tool}"
+                        continue
+                    allowed = False
+                    reason = f"Missing tool: {tool}"
+                    break
+        if require_admin and not self.capabilities.is_admin:
+            allowed = False
+            reason = "Requires administrator/root privileges"
+        if not allowed:
+            button.setEnabled(False)
+            tip = reason if not guidance else f"{reason}. {guidance}"
+            button.setToolTip(tip)
+        elif reason:
+            button.setToolTip(reason if not guidance else f"{reason}. {guidance}")
+
+    def _should_use_powershell(self, command: str) -> bool:
+        if not self.capabilities.is_windows:
+            return False
+        head = command.strip()
+        if head.startswith(("Get-", "Set-", "New-", "Test-", "Invoke-")):
+            return True
+        if "|" in head or "$" in head:
+            return True
+        return False
+
+    def _infer_required_tools(self, command: str) -> List[str]:
+        try:
+            tokens = shlex.split(command, posix=not self.capabilities.is_windows)
+        except ValueError:
+            return []
+        if not tokens:
+            return []
+        if tokens[0] == "sudo":
+            tokens = tokens[1:]
+        if tokens and tokens[0] == "timeout":
+            tokens = tokens[1:]
+        return tokens[:1]
+
+    def closeEvent(self, event) -> None:
+        try:
+            if hasattr(self, "scan_tab"):
+                self.scan_tab._save_discovery_splitter_state()
+        except Exception as exc:
+            self._append_log_line(f"[settings] Splitter save failed on close: {exc}")
+        super().closeEvent(event)
+
     def register_target_field(self, field: TargetField) -> None:
         if not field.share_history:
             return
@@ -1757,44 +2143,185 @@ class NetReaperGui(QWidget):
                     self.target_history.append(current)
                     field.set_history(self.target_history)
 
+    def scan_targets_for_field(self, field: TargetField) -> None:
+        def precheck() -> tuple[bool, str, str]:
+            if not self.capabilities.flag("can_list_interfaces"):
+                reason = self.capabilities.reason("can_list_interfaces") or "Interface discovery unavailable"
+                return False, reason, "Install required tools or run with elevated privileges."
+            return True, "", ""
+
+        def execute() -> ExecutionResult:
+            start = time.time()
+            interfaces = self.provider.get_interfaces()
+            return ExecutionResult(returncode=0, payload={"interfaces": interfaces}, elapsed=time.time() - start)
+
+        def parse(result: ExecutionResult) -> Dict[str, Any]:
+            interfaces = result.payload.get("interfaces", [])
+            ips: List[str] = []
+            for it in interfaces:
+                ipv4 = getattr(it, "ipv4", []) if not isinstance(it, dict) else it.get("ipv4", [])
+                if isinstance(ipv4, list):
+                    ips.extend(ipv4)
+            summary = {"ips": len(ips)}
+            return {"summary": summary, "items": [], "ips": ips}
+
+        def ui_update(payload: Dict[str, Any]) -> None:
+            ips = payload.get("ips", [])
+            if ips:
+                for ip in ips:
+                    if ip not in self.target_history:
+                        self.target_history.append(ip)
+                field.set_history(self.target_history)
+                for target_field in self.target_fields:
+                    target_field.set_history(self.target_history)
+                self._append_log_line(f"[targets] Found IPs: {', '.join(ips)}")
+            else:
+                self._append_log_line("[targets] No local IPs discovered.")
+
+        job = JobSpec(
+            name="Scan Local Targets",
+            category="discovery",
+            precheck=precheck,
+            execute=execute,
+            parse=parse,
+            ui_update=ui_update,
+        )
+        self.job_manager.run_job(job)
+
     def start_discovery(self) -> None:
-        """Run interface/Wi‑Fi/neighbor discovery and update Scan tab + holo map."""
-        # Guard: ensure scan_tab exists
+        """Run interface/Wi-Fi/neighbor discovery and update Scan tab + holo map."""
         scan_tab = getattr(self, "scan_tab", None)
         if scan_tab is None or not hasattr(scan_tab, "update_discovery"):
             QMessageBox.warning(self, "Discovery unavailable", "Scan tab is not ready for discovery updates.")
             return
 
-        # Show progress in the operations console and keep UI responsive
-        self.output_log.appendPlainText("[DISCOVERY] Starting network discovery…")
-        self.status_label.setText("Discovery: running…")
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)  # indeterminate
+        def precheck() -> tuple[bool, str, str]:
+            flags = self.capabilities.feature_flags
+            if not any(
+                flags.get(key, False)
+                for key in (
+                    "can_list_interfaces",
+                    "can_show_routes",
+                    "can_list_sockets",
+                    "can_read_neighbors",
+                    "can_scan_wifi",
+                    "can_host_discovery_quick",
+                )
+            ):
+                return False, "No discovery capabilities available", "Install required tools or run with elevated privileges."
+            return True, "", ""
 
-        self._discovery_thread = DiscoveryThread(rescan_wifi=True, parent=self)
-        self._discovery_thread.log.connect(lambda line: self.output_log.appendPlainText(line))
-        def on_result(payload: dict) -> None:
-            self.progress.setVisible(False)
-            self.progress.setRange(0, 100)
-            errs = payload.get("errors", []) or []
-            if errs:
-                self.output_log.appendPlainText("[DISCOVERY] Completed with warnings:")
-                for e in errs:
-                    self.output_log.appendPlainText(f"  - {e}")
-                self.status_label.setText("Discovery: completed (warnings)")
+        def execute() -> ExecutionResult:
+            start = time.time()
+            errors: List[str] = []
+            interfaces: List[InterfaceRecord] = []
+            routes: List[RouteRecord] = []
+            sockets: List[SocketRecord] = []
+            neighbors: List[NeighborRecord] = []
+            aps: List[WifiAPRecord] = []
+            hosts: List[HostRecord] = []
+
+            if self.capabilities.flag("can_list_interfaces"):
+                try:
+                    interfaces = self.provider.get_interfaces()
+                except Exception as exc:
+                    errors.append(f"Interface discovery failed: {exc}")
             else:
-                self.output_log.appendPlainText("[DISCOVERY] Completed successfully.")
-                self.status_label.setText("Discovery: completed")
+                errors.append(self.capabilities.reason("can_list_interfaces"))
 
-            try:
-                scan_tab.update_discovery(payload)
-            except Exception as ex:
-                self.output_log.appendPlainText(f"[DISCOVERY] UI update error: {ex!r}")
+            if self.capabilities.flag("can_show_routes"):
+                try:
+                    routes = self.provider.get_routes()
+                except Exception as exc:
+                    errors.append(f"Route discovery failed: {exc}")
+            else:
+                errors.append(self.capabilities.reason("can_show_routes"))
 
-        self._discovery_thread.result.connect(on_result)
-        self._discovery_thread.finished.connect(lambda: self.progress.setVisible(False))
-        self._discovery_thread.start()
+            if self.capabilities.flag("can_list_sockets"):
+                try:
+                    sockets = self.provider.get_sockets()
+                except Exception as exc:
+                    errors.append(f"Socket discovery failed: {exc}")
+            else:
+                errors.append(self.capabilities.reason("can_list_sockets"))
 
+            if self.capabilities.flag("can_read_neighbors"):
+                try:
+                    neighbors = self.provider.get_neighbors()
+                except Exception as exc:
+                    errors.append(f"Neighbor discovery failed: {exc}")
+            else:
+                errors.append(self.capabilities.reason("can_read_neighbors"))
+
+            if self.capabilities.flag("can_scan_wifi"):
+                try:
+                    aps = self.provider.scan_wifi()
+                except Exception as exc:
+                    errors.append(f"Wi-Fi scan failed: {exc}")
+            else:
+                errors.append(self.capabilities.reason("can_scan_wifi"))
+
+            if self.capabilities.flag("can_host_discovery_quick"):
+                try:
+                    hosts = self.provider.discover_hosts_quick()
+                except Exception as exc:
+                    errors.append(f"Host discovery failed: {exc}")
+            else:
+                errors.append(self.capabilities.reason("can_host_discovery_quick"))
+
+            payload = {
+                "interfaces": interfaces,
+                "routes": routes,
+                "sockets": sockets,
+                "neighbors": neighbors,
+                "aps": aps,
+                "hosts": hosts,
+                "errors": [e for e in errors if e],
+            }
+            return ExecutionResult(returncode=0, payload=payload, elapsed=time.time() - start)
+
+        def parse(result: ExecutionResult) -> Dict[str, Any]:
+            payload = result.payload or {}
+            summary = {
+                "interfaces": len(payload.get("interfaces", [])),
+                "routes": len(payload.get("routes", [])),
+                "sockets": len(payload.get("sockets", [])),
+                "neighbors": len(payload.get("neighbors", [])),
+                "wifi": len(payload.get("aps", [])),
+                "hosts": len(payload.get("hosts", [])),
+                "errors": len(payload.get("errors", [])),
+            }
+            return {
+                **payload,
+                "summary": summary,
+                "counts": summary,
+                "items": [],
+            }
+
+        def ui_update(payload: Dict[str, Any]) -> None:
+            scan_tab.update_discovery(payload)
+            interfaces = payload.get("interfaces", [])
+            ips = []
+            for it in interfaces:
+                ipv4 = getattr(it, "ipv4", []) if not isinstance(it, dict) else it.get("ipv4", [])
+                if isinstance(ipv4, list):
+                    ips.extend(ipv4)
+            if ips:
+                for ip in ips:
+                    if ip not in self.target_history:
+                        self.target_history.append(ip)
+                for field in self.target_fields:
+                    field.set_history(self.target_history)
+
+        job = JobSpec(
+            name="Network Discovery",
+            category="discovery",
+            precheck=precheck,
+            execute=execute,
+            parse=parse,
+            ui_update=ui_update,
+        )
+        self.job_manager.run_job(job)
 
 
     def add_target_history(self, target: str) -> None:
@@ -1831,8 +2358,8 @@ class NetReaperGui(QWidget):
                 os.makedirs(os.path.dirname(history_path), exist_ok=True)
                 with open(history_path, "w", encoding="utf-8") as fh:
                     fh.write("\n".join(self.bssid_history))
-            except OSError:
-                pass
+            except OSError as exc:
+                self._append_log_line(f"[history] Failed to save BSSID history: {exc}")
 
     def _load_target_history(self) -> None:
         history_paths = [
@@ -1863,89 +2390,235 @@ class NetReaperGui(QWidget):
             entries = []
         self.bssid_history = entries[:20]
 
-    def execute_command(self, command: str, description: str, target: Optional[str] = None) -> None:
-        """Execute a shell command with security hardening."""
+    def save_diagnostics(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save diagnostics",
+            os.path.expanduser("~/netreaper_diagnostics.json"),
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        context = {
+            "platform": self.capabilities.platform,
+            "is_windows": self.capabilities.is_windows,
+            "is_linux": self.capabilities.is_linux,
+            "is_wsl": self.capabilities.is_wsl,
+            "is_admin": self.capabilities.is_admin,
+            "tools": self.capabilities.tools,
+            "features": self.capabilities.feature_flags,
+            "job_history": self.job_manager.job_history,
+        }
         try:
-            cmd_tokens = shlex.split(command)
-        except ValueError as e:
-            QMessageBox.warning(self, "Invalid command", f"Command parsing failed: {e}")
+            self.job_manager.export_diagnostics(path, context)
+            self._append_log_line(f"[diag] Saved diagnostics to {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Diagnostics failed", f"Failed to save diagnostics: {exc}")
+
+    def run_self_test(self) -> None:
+        """Run provider self-tests and update discovery views."""
+        scan_tab = getattr(self, "scan_tab", None)
+        if scan_tab is None or not hasattr(scan_tab, "update_discovery"):
+            QMessageBox.warning(self, "Self test unavailable", "Scan tab is not ready for diagnostics.")
             return
-        
-        if not cmd_tokens:
+
+        def execute() -> ExecutionResult:
+            start = time.time()
+            errors: List[str] = []
+            payload: Dict[str, Any] = {
+                "interfaces": [],
+                "routes": [],
+                "sockets": [],
+                "neighbors": [],
+                "aps": [],
+                "hosts": [],
+                "errors": [],
+            }
+
+            tests = [
+                ("interfaces", self.provider.get_interfaces, ["name", "state", "mac"]),
+                ("routes", self.provider.get_routes, ["destination", "gateway", "interface"]),
+                ("sockets", self.provider.get_sockets, ["proto", "local_address", "remote_address"]),
+                ("neighbors", self.provider.get_neighbors, ["ip", "mac", "state"]),
+                ("aps", self.provider.scan_wifi, ["ssid", "bssid", "channel"]),
+                ("hosts", self.provider.discover_hosts_quick, ["ip", "state"]),
+            ]
+
+            for key, fn, required_fields in tests:
+                try:
+                    records = fn()
+                    payload[key] = records
+                    for idx, record in enumerate(records):
+                        for field in required_fields:
+                            value = getattr(record, field, None) if not isinstance(record, dict) else record.get(field)
+                            if value is None:
+                                errors.append(f"{key}[{idx}] missing field: {field}")
+                except Exception as exc:
+                    errors.append(f"{key} test failed: {exc}")
+
+            payload["errors"] = errors
+            return ExecutionResult(returncode=0 if not errors else 1, payload=payload, elapsed=time.time() - start)
+
+        def parse(result: ExecutionResult) -> Dict[str, Any]:
+            payload = result.payload or {}
+            summary = {
+                "interfaces": len(payload.get("interfaces", [])),
+                "routes": len(payload.get("routes", [])),
+                "sockets": len(payload.get("sockets", [])),
+                "neighbors": len(payload.get("neighbors", [])),
+                "wifi": len(payload.get("aps", [])),
+                "hosts": len(payload.get("hosts", [])),
+                "errors": len(payload.get("errors", [])),
+            }
+            return {
+                **payload,
+                "summary": summary,
+                "counts": summary,
+                "items": [],
+            }
+
+        def ui_update(payload: Dict[str, Any]) -> None:
+            scan_tab.update_discovery(payload)
+
+        job = JobSpec(
+            name="Self Test",
+            category="diagnostics",
+            execute=execute,
+            parse=parse,
+            ui_update=ui_update,
+        )
+        self.job_manager.run_job(job)
+
+    def execute_command(self, command: str, description: str, target: Optional[str] = None, *, use_powershell: Optional[bool] = None, is_linux_command: bool = False, timeout: int = 120) -> Optional[str]:
+        """Execute a command via the unified job pipeline."""
+        command = command.strip()
+        if not command:
             QMessageBox.warning(self, "Empty command", "No command provided")
-            return
-        
-        tool = cmd_tokens[0] if cmd_tokens[0] != 'sudo' else cmd_tokens[1]
-        
-        tool_path = shutil.which(tool)
-        if tool_path is None:
-            QMessageBox.warning(self, "Tool missing", f"The command '{tool}' is not in PATH.")
-            return
-        if not os.access(tool_path, os.X_OK):
-            QMessageBox.warning(self, "Tool not executable", f"'{tool}' is not executable.")
-            return
-        
-        actual_command = command
-        if self.lite_mode and not command.startswith("NR_LITE_MODE="):
-            actual_command = f"NR_LITE_MODE=1 {command}"
-        
-        if hasattr(self, "custom_wordlist") and self.custom_wordlist:
-            actual_command = f"DEFAULT_WORDLIST={shlex.quote(self.custom_wordlist)} {actual_command}"
-        
-        sudo_password = None
-        if cmd_tokens[0] == "sudo":
-            password, ok = QInputDialog.getText(self, "Sudo Password", "Enter password for sudo:", QLineEdit.EchoMode.Password)
-            if not ok:
-                self.output_log.appendPlainText("[info] Sudo command cancelled by user.")
-                self.output_status_label.setText("Status: idle (sudo cancelled)")
-                return
-            sudo_password = password
-        
-        log_command = self.sanitize_command_for_display(actual_command)
+            return None
+
+        use_powershell = self._should_use_powershell(command) if use_powershell is None else use_powershell
+        required_tools = [] if use_powershell else self._infer_required_tools(command)
+        requires_admin = command.startswith("sudo")
+        if self.capabilities.is_windows and not is_linux_command and required_tools:
+            if not shutil.which(required_tools[0]) and self.capabilities.tools.get("wsl", False):
+                is_linux_command = True
+
+        def precheck() -> tuple[bool, str, str]:
+            if is_linux_command and not self.capabilities.tools.get("wsl", False):
+                return False, "WSL not available", "Install WSL to run Linux commands."
+            if requires_admin and not self.capabilities.is_admin:
+                return False, "Requires administrator/root privileges", "Rerun the GUI as admin/root."
+            if use_powershell and not (self.capabilities.tools.get("powershell", False) or shutil.which("powershell")):
+                return False, "PowerShell not available", "Install or enable PowerShell."
+            if required_tools and not is_linux_command:
+                for tool in required_tools:
+                    if not tool:
+                        continue
+                    if not (self.capabilities.tools.get(tool, False) or shutil.which(tool)):
+                        return False, f"Missing tool: {tool}", "Install the required tool and try again."
+            return True, "", ""
+
+        def execute() -> ExecutionResult:
+            start = time.time()
+            run_command = command
+            if requires_admin and self.capabilities.is_admin and not shutil.which("sudo"):
+                if run_command.startswith("sudo"):
+                    run_command = run_command[len("sudo"):].strip()
+
+            env = os.environ.copy()
+            if self.lite_mode:
+                env["NR_LITE_MODE"] = "1"
+            if self.custom_wordlist:
+                env["DEFAULT_WORDLIST"] = self.custom_wordlist
+
+            if is_linux_command:
+                cmd_list = ["wsl", "-e"] + shlex.split(run_command)
+            elif use_powershell:
+                cmd_list = ["powershell", "-NoProfile", "-Command", run_command]
+            else:
+                cmd_list = shlex.split(run_command)
+
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+            process = subprocess.Popen(
+                cmd_list,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                creationflags=creationflags,
+            )
+            self._active_processes[job_id] = process
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+                returncode = process.returncode
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                returncode = 1
+                return ExecutionResult(
+                    returncode=returncode,
+                    stdout=stdout.splitlines(),
+                    stderr=stderr.splitlines(),
+                    error="Command timed out",
+                    elapsed=time.time() - start,
+                )
+            finally:
+                self._active_processes.pop(job_id, None)
+
+            return ExecutionResult(
+                returncode=returncode,
+                stdout=stdout.splitlines(),
+                stderr=stderr.splitlines(),
+                elapsed=time.time() - start,
+            )
+
+        def parse(result: ExecutionResult) -> Dict[str, Any]:
+            summary = {
+                "returncode": result.returncode,
+                "stdout_lines": len(result.stdout),
+                "stderr_lines": len(result.stderr),
+            }
+            return {
+                "summary": summary,
+                "counts": summary,
+                "items": [],
+            }
+
+        def ui_update(payload: Dict[str, Any]) -> None:
+            status = "success" if payload.get("summary", {}).get("returncode", 1) == 0 else "failed"
+            self.output_status_label.setText(f"Status: {status} ({description})")
+
+        job_id = uuid4().hex[:8].upper()
+        if target:
+            self.add_target_history(target)
+
+        log_command = self.sanitize_command_for_display(command)
         self.current_command_label.setText(f"Command: {log_command}")
         self.output_status_label.setText(f"Status: running ({description})")
         if hasattr(self, "output_panel"):
             self.output_panel.set_status("#5ad6ff")
-        self.output_log.appendPlainText(f"[{description}] $ {log_command}")
-        
-        if target:
-            self.add_target_history(target)
-        
-        thread = CommandThread(actual_command, sudo_password=sudo_password, sanitize_output=True)
-        thread.output.connect(self.output_log.appendPlainText)
-        thread.finished.connect(self.on_finished)
-        thread.finished.connect(lambda _: self.resize_log())
-        self.active_threads.append(thread)
-        thread.finished.connect(lambda code, thr=thread: self.cleanup_thread(thr))
-        self.ingress_online = True
-        self.refresh_reaper_header()
-        thread.start()
+        self._append_log_line(f"[{description}] $ {log_command}")
 
         item = QListWidgetItem(f"{description}: {log_command}")
-        item.setData(Qt.ItemDataRole.UserRole, actual_command)
+        item.setData(Qt.ItemDataRole.UserRole, command)
         self.history_list.addItem(item)
         self.history_panel.set_status("#5ad6ff")
-    
+
+        job = JobSpec(
+            name=description,
+            category="command",
+            precheck=precheck,
+            execute=execute,
+            parse=parse,
+            ui_update=ui_update,
+            job_id=job_id,
+        )
+        self.job_manager.run_job(job)
+        return job_id
+
     def sanitize_command_for_display(self, command: str) -> str:
         """Redact sensitive information from commands before logging or displaying."""
         return sanitize_command_for_display(command)
-
-    def cleanup_thread(self, thread: CommandThread) -> None:
-        if thread in self.active_threads:
-            self.active_threads.remove(thread)
-        if not self.active_threads:
-            self.ingress_online = False
-        self.refresh_reaper_header()
-
-    def on_finished(self, return_code: int) -> None:
-        self.output_log.appendPlainText(f"[status] Return code: {return_code}\n")
-        status_text = f"Status: finished (code {return_code})"
-        self.output_status_label.setText(status_text)
-        color = "#3dd598" if return_code == 0 else "#ff7b7b"
-        if hasattr(self, "output_panel"):
-            self.output_panel.set_status(color)
-        if hasattr(self, "history_panel"):
-            self.history_panel.set_status(color)
 
     def clear_log(self) -> None:
         self.output_log.clear()
@@ -2007,7 +2680,7 @@ class NetReaperGui(QWidget):
             self.session_id,
             target,
             self.ingress_online,
-            len(self.active_threads),
+            len(self.active_jobs),
         )
 
     def switch_to_tab(self, widget: QWidget) -> None:
@@ -2025,17 +2698,26 @@ class NetReaperGui(QWidget):
             self.cmd_input.clear()
 
     def stop_all_tasks(self) -> None:
-        """Terminate all running command threads and clear the active thread list."""
-        if not self.active_threads:
-            self.output_log.appendPlainText("[info] No active tasks to stop")
+        """Terminate running command processes and clear active jobs."""
+        if not self._active_processes:
+            self._append_log_line("[info] No active tasks to stop")
             return
-        self.output_log.appendPlainText("[info] Stopping all active tasks...")
-        for thread in list(self.active_threads):
+        self._append_log_line("[info] Stopping all active tasks...")
+        for job_id, process in list(self._active_processes.items()):
             try:
-                thread.terminate()
-            except Exception:
-                pass
-        self.active_threads.clear()
+                if sys.platform == "win32":
+                    process.kill()
+                else:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1)
+                    except Exception as exc:
+                        process.kill()
+                        self._append_log_line(f"[warn] Force-killed job {job_id}: {exc}")
+            except Exception as exc:
+                self._append_log_line(f"[warn] Failed to stop job {job_id}: {exc}")
+        self._active_processes.clear()
+        self.active_jobs.clear()
         self.ingress_online = False
         self.refresh_reaper_header()
         self.output_status_label.setText("Status: stopped")
