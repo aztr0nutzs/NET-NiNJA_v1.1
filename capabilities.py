@@ -86,15 +86,31 @@ def _detect_npcap() -> bool:
         return False
 
 
-def detect_capabilities() -> CapabilityMatrix:
+def detect_capabilities(backend_mode: str = "native", wsl_distro: str = "") -> CapabilityMatrix:
+    """
+    Detect system capabilities.
+    
+    Args:
+        backend_mode: "native" or "wsl"
+        wsl_distro: WSL distribution name (for wsl mode)
+    
+    Returns:
+        CapabilityMatrix with detected capabilities
+    """
     system = platform.system().lower()
     is_windows = system == "windows"
     is_linux = system == "linux"
     is_wsl = _detect_wsl()
     is_admin = _is_admin_windows() if is_windows else _is_admin_linux()
 
+    # If WSL mode is requested, treat as Linux for capability detection
+    if backend_mode == "wsl":
+        os_key = "wsl"
+    else:
+        os_key = "windows" if is_windows else "linux"
+
     tools: Dict[str, bool] = {}
-    if is_linux:
+    if is_linux or backend_mode == "wsl":
         for tool in ("ip", "iw", "nmcli", "ss", "nmap", "arp-scan", "ethtool", "ping"):
             tools[tool] = _has_tool(tool)
     if is_windows:
@@ -112,7 +128,7 @@ def detect_capabilities() -> CapabilityMatrix:
     feature_flags: Dict[str, bool] = {}
     reasons: Dict[str, str] = {}
 
-    if is_linux:
+    if is_linux or backend_mode == "wsl":
         feature_flags["can_list_interfaces"] = tools.get("ip", False)
         if not feature_flags["can_list_interfaces"]:
             reasons["can_list_interfaces"] = "Missing tool: ip"
@@ -141,7 +157,7 @@ def detect_capabilities() -> CapabilityMatrix:
         if not feature_flags["can_host_discovery_full"]:
             reasons["can_host_discovery_full"] = "Missing tool: nmap"
 
-    if is_windows:
+    if is_windows and backend_mode != "wsl":
         feature_flags["can_list_interfaces"] = tools.get("Get-NetAdapter", False) or tools.get("ipconfig", False)
         if not feature_flags["can_list_interfaces"]:
             reasons["can_list_interfaces"] = "Missing PowerShell Get-NetAdapter or ipconfig"
@@ -176,7 +192,6 @@ def detect_capabilities() -> CapabilityMatrix:
                 reasons.setdefault(flag, "Admin privileges recommended for full results")
 
     matrix = get_feature_matrix()
-    os_key = "windows" if is_windows else "linux"
     feature_support: Dict[str, Dict[str, object]] = {}
     for key, defn in matrix.items():
         feature_support[key] = resolve_feature_support(defn, os_key, tools, is_admin)
