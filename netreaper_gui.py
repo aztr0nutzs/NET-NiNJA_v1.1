@@ -57,6 +57,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QInputDialog,
     QProgressBar,
+    QTabWidget,
 )
 
 # Optional WebEngine for embedded HTML (holographic map)
