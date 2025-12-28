@@ -280,6 +280,9 @@ class TargetField(QWidget):
         self.combo.blockSignals(False)
 
     def value(self) -> str:
+        data = self.combo.currentData()
+        if isinstance(data, str) and data.strip():
+            return data.strip()
         return self.combo.currentText().strip()
 
 
@@ -810,6 +813,24 @@ class ScanTab(CategoryTab):
                 return item.get(attr, default)
             return getattr(item, attr, default)
 
+        def display_ssid(value: str) -> str:
+            value = str(value or "").strip()
+            return value if value else "Hidden SSID"
+
+        def display_signal(value: str) -> str:
+            value = str(value or "").strip()
+            if not value:
+                return "?"
+            if value.endswith("%"):
+                return value
+            return f"{value}%" if value.isdigit() else value
+
+        def display_security(value: str) -> str:
+            value = str(value or "").strip()
+            if not value or value == "--":
+                return "Open"
+            return value
+
         self.iface_table.setRowCount(len(interfaces))
         for r, it in enumerate(interfaces):
             set_row(self.iface_table, r, 0, str(get_value(it, "name", "")))
@@ -848,11 +869,12 @@ class ScanTab(CategoryTab):
 
         self.ap_table.setRowCount(len(aps))
         for r, ap in enumerate(aps):
-            set_row(self.ap_table, r, 0, str(get_value(ap, "ssid", "")))
+            set_row(self.ap_table, r, 0, display_ssid(get_value(ap, "ssid", "")))
             set_row(self.ap_table, r, 1, str(get_value(ap, "bssid", "")))
-            set_row(self.ap_table, r, 2, str(get_value(ap, "channel", "")))
-            set_row(self.ap_table, r, 3, str(get_value(ap, "signal", "")))
-            set_row(self.ap_table, r, 4, str(get_value(ap, "security", "")))
+            channel = str(get_value(ap, "channel", "") or "").strip() or "?"
+            set_row(self.ap_table, r, 2, channel)
+            set_row(self.ap_table, r, 3, display_signal(get_value(ap, "signal", "")))
+            set_row(self.ap_table, r, 4, display_security(get_value(ap, "security", "")))
 
         self.host_table.setRowCount(len(hosts))
         for r, h in enumerate(hosts):
@@ -1289,6 +1311,7 @@ class WirelessTab(CategoryTab):
     def __init__(self, executor, main_window):
         super().__init__(executor, main_window)
         self.executor = executor
+        self._wifi_entries: List[Dict[str, str]] = []
         self.iface_field = TargetField("Wireless interface", share_history=False)
         self.iface_field.scan_btn.setText("Refresh Interfaces")
         self.iface_field.scan_requested.connect(lambda _field: self.refresh_interfaces())
@@ -1301,6 +1324,14 @@ class WirelessTab(CategoryTab):
         # Register BSSID field with the main window for shared history
         if main_window:
             main_window.register_bssid_field(self.bssid_field)
+        self.bssid_filter = QLineEdit()
+        self.bssid_filter.setPlaceholderText("Filter by SSID, BSSID, channel, security")
+        self.bssid_filter.textChanged.connect(self._apply_bssid_filter)
+        self.bssid_filter_status = QLabel("Showing 0 of 0 networks")
+        self.wifi_scan_status = QLabel("Wi-Fi scan status: idle")
+        self.wifi_scan_progress = QProgressBar()
+        self.wifi_scan_progress.setTextVisible(False)
+        self.wifi_scan_progress.setVisible(False)
         self.channel_input = QLineEdit()
         self.channel_input.setPlaceholderText("Channel")
         self.attack_combo = QComboBox()
@@ -1320,6 +1351,15 @@ class WirelessTab(CategoryTab):
         target_layout.setContentsMargins(0, 0, 0, 0)
         target_layout.addWidget(self.iface_field)
         target_layout.addWidget(self.bssid_field)
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter"))
+        filter_layout.addWidget(self.bssid_filter)
+        filter_layout.addWidget(self.bssid_filter_status)
+        target_layout.addLayout(filter_layout)
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(self.wifi_scan_status)
+        status_layout.addWidget(self.wifi_scan_progress, 1)
+        target_layout.addLayout(status_layout)
         target_layout.addLayout(channel_layout)
 
         self.add_panel("Interfaces & Targets", target_box, "Select interfaces, BSSIDs, and channels.", column_span=2)
@@ -1451,9 +1491,11 @@ class WirelessTab(CategoryTab):
 
     def refresh_bssids(self) -> None:
         """Populate the BSSID selector from a Wi-Fi scan."""
+        self._set_wifi_scan_state("Wi-Fi scan in progress...", active=True)
         def precheck() -> tuple[bool, str, str]:
             if not self.main_window.capabilities.flag("can_scan_wifi"):
                 reason = self.main_window.capabilities.reason("can_scan_wifi") or "Wi-Fi scan unavailable"
+                self._set_wifi_scan_state(f"Wi-Fi scan blocked: {reason}", active=False)
                 return False, reason, "Install required tools or run with elevated privileges."
             return True, "", ""
 
@@ -1464,17 +1506,65 @@ class WirelessTab(CategoryTab):
 
         def parse(result: ExecutionResult) -> Dict[str, Any]:
             aps = result.payload.get("aps", [])
-            bssids = [getattr(ap, "bssid", "") if not isinstance(ap, dict) else ap.get("bssid", "") for ap in aps]
-            summary = {"bssids": len([b for b in bssids if b])}
-            return {"summary": summary, "items": [], "bssids": [b for b in bssids if b]}
+            entries: List[Dict[str, str]] = []
+
+            def get_value(item, attr, default="") -> str:
+                if isinstance(item, dict):
+                    return str(item.get(attr, default) or "")
+                return str(getattr(item, attr, default) or "")
+
+            def normalize_ssid(value: str) -> str:
+                value = value.strip()
+                return value if value else "Hidden SSID"
+
+            def normalize_signal(value: str) -> str:
+                value = value.strip()
+                if not value:
+                    return "?"
+                if value.endswith("%"):
+                    return value
+                return f"{value}%" if value.isdigit() else value
+
+            def normalize_security(value: str) -> str:
+                value = value.strip()
+                if not value or value == "--":
+                    return "Open"
+                return value
+
+            for ap in aps:
+                bssid = get_value(ap, "bssid").strip()
+                if not bssid:
+                    continue
+                ssid = normalize_ssid(get_value(ap, "ssid"))
+                channel = get_value(ap, "channel").strip() or "?"
+                signal = normalize_signal(get_value(ap, "signal"))
+                security = normalize_security(get_value(ap, "security"))
+                display = f"{ssid} | {bssid} | ch {channel} | {signal} | {security}"
+                entries.append({"display": display, "bssid": bssid})
+
+            summary = {"bssids": len(entries)}
+            return {"summary": summary, "items": [], "entries": entries}
 
         def ui_update(payload: Dict[str, Any]) -> None:
-            bssids = payload.get("bssids", [])
-            self.bssid_field.combo.clear()
-            if bssids:
-                self.bssid_field.combo.addItems(bssids)
-            summary = ", ".join(bssids) if bssids else "no BSSIDs detected"
-            self.main_window._append_log_line(f"[wireless] BSSIDs refreshed: {summary}")
+            entries = payload.get("entries", [])
+            self._wifi_entries = entries
+            self._apply_bssid_filter()
+            if entries:
+                self._set_wifi_scan_state(
+                    f"Wi-Fi scan complete: {len(entries)} network(s) found.",
+                    active=False,
+                )
+                self.main_window._append_log_line(
+                    f"[wireless] Wi-Fi scan complete: {len(entries)} network(s) found. BSSID list updated."
+                )
+            else:
+                self._set_wifi_scan_state(
+                    "Wi-Fi scan complete: no networks detected.",
+                    active=False,
+                )
+                self.main_window._append_log_line(
+                    "[wireless] Wi-Fi scan complete: no networks detected. Check adapter mode and permissions."
+                )
 
         job = JobSpec(
             name="Scan Wi-Fi",
@@ -1485,6 +1575,32 @@ class WirelessTab(CategoryTab):
             ui_update=ui_update,
         )
         self.run_job(job)
+
+    def _set_wifi_scan_state(self, message: str, *, active: bool) -> None:
+        self.wifi_scan_status.setText(f"Wi-Fi scan status: {message}")
+        if active:
+            self.wifi_scan_progress.setVisible(True)
+            self.wifi_scan_progress.setRange(0, 0)
+        else:
+            self.wifi_scan_progress.setRange(0, 1)
+            self.wifi_scan_progress.setValue(1)
+            self.wifi_scan_progress.setVisible(False)
+
+    def _apply_bssid_filter(self) -> None:
+        query = self.bssid_filter.text().strip().lower()
+        self.bssid_field.combo.blockSignals(True)
+        self.bssid_field.combo.clear()
+        shown = 0
+        for entry in self._wifi_entries:
+            display = entry.get("display", "")
+            bssid = entry.get("bssid", "")
+            haystack = f"{display} {bssid}".lower()
+            if not query or query in haystack:
+                self.bssid_field.combo.addItem(display, bssid)
+                shown += 1
+        self.bssid_field.combo.blockSignals(False)
+        total = len(self._wifi_entries)
+        self.bssid_filter_status.setText(f"Showing {shown} of {total} networks")
 
     def enable_monitor(self) -> None:
         iface = self.iface()
