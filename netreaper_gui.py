@@ -9,6 +9,18 @@ hammer controls that security engineers expect.
 
 from __future__ import annotations
 
+
+import os
+import sys
+
+def resource_path(relative_path: str) -> str:
+    """Get absolute path to resource, works for dev and PyInstaller."""
+    try:
+        base_path = sys._MEIPASS  # type: ignore[attr-defined]
+    except Exception:
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
+
 import shlex
 import json
 import subprocess
@@ -21,12 +33,12 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, QEventLoop, Qt, pyqtSignal, QUrl, QSettings, QByteArray
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, QEventLoop, Qt, pyqtSignal, QUrl, QSettings, QByteArray, QObject, QThread
 
 import shutil  # For checking tool availability
 
 import os  # Added for interface discovery and history loading
-from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,6 +54,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMenuBar,
     QMessageBox,
     QPushButton,
@@ -60,6 +73,9 @@ from PyQt6.QtWidgets import (
     QTabWidget,
 )
 
+
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 # Optional WebEngine for embedded HTML (holographic map)
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -76,6 +92,7 @@ from gui_components import PanelWindow, PanelWorkspacePage
 from gui_theme import apply_bio_theme
 from security_utils import sanitize_command_for_display
 from capabilities import detect_capabilities
+from camera_ip import DiscoveredCamera, guess_rtsp_urls, ws_discover
 from providers import get_provider
 from providers.base import HostRecord, InterfaceRecord, NeighborRecord, RouteRecord, SocketRecord, WifiAPRecord
 from job_pipeline import ExecutionResult, JobManager, JobSpec
@@ -164,65 +181,70 @@ class HUDPanel(QWidget):
         self.latency_label.setText(f"Latency: {latency} ms")
 
 
-class ReaperHeader(QFrame):
-    """Top hero bar with live session stats and quick navigation."""
+class ScaledPixmapLabel(QLabel):
+    """QLabel that scales an original pixmap to the widget size (smooth), used for pixel-perfect header strips."""
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, path: str, fixed_height: int | None = None, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setObjectName("reaperHeader")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(14)
+        self._orig = QPixmap(path)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        if fixed_height is not None:
+            self.setFixedHeight(fixed_height)
+        # paint initial
+        self._rescale()
 
-        left = QVBoxLayout()
-        self.title = QLabel("THE REAPER IS WATCHING")
-        self.title.setObjectName("reaperTitle")
-        self.subtitle = QLabel("Bio-lab containment • Neural feeds • pathogen telemetry")
-        self.subtitle.setObjectName("reaperSubtitle")
-        left.addWidget(self.title)
-        left.addWidget(self.subtitle)
+    def _rescale(self) -> None:
+        if self._orig.isNull():
+            self.clear()
+            return
+        size = self.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        self.setPixmap(self._orig.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
 
-        stats_grid = QGridLayout()
-        stats_grid.setHorizontalSpacing(12)
-        stats_grid.setVerticalSpacing(4)
-        self.session_label = QLabel("Session: —")
-        self.time_label = QLabel("Local: --:--:--")
-        self.ingress_label = QLabel("Ingress: STANDBY")
-        self.target_label = QLabel("Target: —")
-        stats_grid.addWidget(self.session_label, 0, 0)
-        stats_grid.addWidget(self.time_label, 0, 1)
-        stats_grid.addWidget(self.ingress_label, 1, 0)
-        stats_grid.addWidget(self.target_label, 1, 1)
-        stats_frame = QWidget()
-        stats_frame.setObjectName("reaperStats")
-        stats_frame.setLayout(stats_grid)
-        left.addWidget(stats_frame)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
 
-        self.buttons = QHBoxLayout()
-        self.buttons.setSpacing(8)
-        left.addLayout(self.buttons)
-        layout.addLayout(left, stretch=3)
 
-        glyph_frame = QVBoxLayout()
-        glyph_frame.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.glyph = QLabel("☠")
-        self.glyph.setObjectName("reaperGlyph")
-        self.glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.glyph.setFixedWidth(64)
-        glyph_frame.addWidget(self.glyph)
-        layout.addLayout(glyph_frame, stretch=1)
 
-    def add_nav_button(self, text: str, callback) -> None:
-        btn = QPushButton(text)
-        btn.clicked.connect(callback)
-        self.buttons.addWidget(btn)
+class ReaperHeader(QFrame):
+    """Pixel-faithful NET-NiNJA header.
 
-    def update_stats(self, session: str, target: str, ingress: bool, active_jobs: int) -> None:
-        self.session_label.setText(f"Session: {session}")
-        self.time_label.setText(f"Local: {datetime.now().strftime('%H:%M:%S')}")
-        state = "ONLINE" if ingress else "STANDBY"
-        self.ingress_label.setText(f"Ingress: {state}")
-        self.target_label.setText(f"Target: {target or '—'} | Jobs: {active_jobs}")
+    This header is rendered from a single composite reference image (imgs/header_reference.png).
+    No layout math, no font drift, no QSS drift — what you see is exactly the image.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ReaperHeader")
+        self.setFrameShape(QFrame.NoFrame)
+
+        ref_path = resource_path("imgs/header_reference.png")
+        self._pix = QPixmap(ref_path)
+
+        # Hard fail early with a clear message if the asset is missing.
+        if self._pix.isNull():
+            raise FileNotFoundError(f"Missing header reference image: {ref_path}")
+
+        # Lock height to the exact reference height. Width is handled via window sizing/min width.
+        self.setFixedHeight(self._pix.height())
+        self.setMinimumWidth(self._pix.width())
+
+    def reference_size(self) -> QSize:
+        return self._pix.size()
+
+    def sizeHint(self) -> QSize:
+        return self._pix.size()
+
+    def paintEvent(self, event) -> None:
+        # Draw the reference image at (0,0) without scaling so it stays pixel-perfect.
+        # Any extra space is simply filled with black.
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0))
+        painter.drawPixmap(0, 0, self._pix)
+        painter.end()
 
 class TargetField(QWidget):
     """Reusable target selector with editable combo box."""
@@ -258,6 +280,9 @@ class TargetField(QWidget):
         self.combo.blockSignals(False)
 
     def value(self) -> str:
+        data = self.combo.currentData()
+        if isinstance(data, str) and data.strip():
+            return data.strip()
         return self.combo.currentText().strip()
 
 
@@ -788,6 +813,24 @@ class ScanTab(CategoryTab):
                 return item.get(attr, default)
             return getattr(item, attr, default)
 
+        def display_ssid(value: str) -> str:
+            value = str(value or "").strip()
+            return value if value else "Hidden SSID"
+
+        def display_signal(value: str) -> str:
+            value = str(value or "").strip()
+            if not value:
+                return "?"
+            if value.endswith("%"):
+                return value
+            return f"{value}%" if value.isdigit() else value
+
+        def display_security(value: str) -> str:
+            value = str(value or "").strip()
+            if not value or value == "--":
+                return "Open"
+            return value
+
         self.iface_table.setRowCount(len(interfaces))
         for r, it in enumerate(interfaces):
             set_row(self.iface_table, r, 0, str(get_value(it, "name", "")))
@@ -826,11 +869,12 @@ class ScanTab(CategoryTab):
 
         self.ap_table.setRowCount(len(aps))
         for r, ap in enumerate(aps):
-            set_row(self.ap_table, r, 0, str(get_value(ap, "ssid", "")))
+            set_row(self.ap_table, r, 0, display_ssid(get_value(ap, "ssid", "")))
             set_row(self.ap_table, r, 1, str(get_value(ap, "bssid", "")))
-            set_row(self.ap_table, r, 2, str(get_value(ap, "channel", "")))
-            set_row(self.ap_table, r, 3, str(get_value(ap, "signal", "")))
-            set_row(self.ap_table, r, 4, str(get_value(ap, "security", "")))
+            channel = str(get_value(ap, "channel", "") or "").strip() or "?"
+            set_row(self.ap_table, r, 2, channel)
+            set_row(self.ap_table, r, 3, display_signal(get_value(ap, "signal", "")))
+            set_row(self.ap_table, r, 4, display_security(get_value(ap, "security", "")))
 
         self.host_table.setRowCount(len(hosts))
         for r, h in enumerate(hosts):
@@ -1267,6 +1311,7 @@ class WirelessTab(CategoryTab):
     def __init__(self, executor, main_window):
         super().__init__(executor, main_window)
         self.executor = executor
+        self._wifi_entries: List[Dict[str, str]] = []
         self.iface_field = TargetField("Wireless interface", share_history=False)
         self.iface_field.scan_btn.setText("Refresh Interfaces")
         self.iface_field.scan_requested.connect(lambda _field: self.refresh_interfaces())
@@ -1279,6 +1324,14 @@ class WirelessTab(CategoryTab):
         # Register BSSID field with the main window for shared history
         if main_window:
             main_window.register_bssid_field(self.bssid_field)
+        self.bssid_filter = QLineEdit()
+        self.bssid_filter.setPlaceholderText("Filter by SSID, BSSID, channel, security")
+        self.bssid_filter.textChanged.connect(self._apply_bssid_filter)
+        self.bssid_filter_status = QLabel("Showing 0 of 0 networks")
+        self.wifi_scan_status = QLabel("Wi-Fi scan status: idle")
+        self.wifi_scan_progress = QProgressBar()
+        self.wifi_scan_progress.setTextVisible(False)
+        self.wifi_scan_progress.setVisible(False)
         self.channel_input = QLineEdit()
         self.channel_input.setPlaceholderText("Channel")
         self.attack_combo = QComboBox()
@@ -1298,6 +1351,15 @@ class WirelessTab(CategoryTab):
         target_layout.setContentsMargins(0, 0, 0, 0)
         target_layout.addWidget(self.iface_field)
         target_layout.addWidget(self.bssid_field)
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter"))
+        filter_layout.addWidget(self.bssid_filter)
+        filter_layout.addWidget(self.bssid_filter_status)
+        target_layout.addLayout(filter_layout)
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(self.wifi_scan_status)
+        status_layout.addWidget(self.wifi_scan_progress, 1)
+        target_layout.addLayout(status_layout)
         target_layout.addLayout(channel_layout)
 
         self.add_panel("Interfaces & Targets", target_box, "Select interfaces, BSSIDs, and channels.", column_span=2)
@@ -1429,9 +1491,11 @@ class WirelessTab(CategoryTab):
 
     def refresh_bssids(self) -> None:
         """Populate the BSSID selector from a Wi-Fi scan."""
+        self._set_wifi_scan_state("Wi-Fi scan in progress...", active=True)
         def precheck() -> tuple[bool, str, str]:
             if not self.main_window.capabilities.flag("can_scan_wifi"):
                 reason = self.main_window.capabilities.reason("can_scan_wifi") or "Wi-Fi scan unavailable"
+                self._set_wifi_scan_state(f"Wi-Fi scan blocked: {reason}", active=False)
                 return False, reason, "Install required tools or run with elevated privileges."
             return True, "", ""
 
@@ -1442,17 +1506,65 @@ class WirelessTab(CategoryTab):
 
         def parse(result: ExecutionResult) -> Dict[str, Any]:
             aps = result.payload.get("aps", [])
-            bssids = [getattr(ap, "bssid", "") if not isinstance(ap, dict) else ap.get("bssid", "") for ap in aps]
-            summary = {"bssids": len([b for b in bssids if b])}
-            return {"summary": summary, "items": [], "bssids": [b for b in bssids if b]}
+            entries: List[Dict[str, str]] = []
+
+            def get_value(item, attr, default="") -> str:
+                if isinstance(item, dict):
+                    return str(item.get(attr, default) or "")
+                return str(getattr(item, attr, default) or "")
+
+            def normalize_ssid(value: str) -> str:
+                value = value.strip()
+                return value if value else "Hidden SSID"
+
+            def normalize_signal(value: str) -> str:
+                value = value.strip()
+                if not value:
+                    return "?"
+                if value.endswith("%"):
+                    return value
+                return f"{value}%" if value.isdigit() else value
+
+            def normalize_security(value: str) -> str:
+                value = value.strip()
+                if not value or value == "--":
+                    return "Open"
+                return value
+
+            for ap in aps:
+                bssid = get_value(ap, "bssid").strip()
+                if not bssid:
+                    continue
+                ssid = normalize_ssid(get_value(ap, "ssid"))
+                channel = get_value(ap, "channel").strip() or "?"
+                signal = normalize_signal(get_value(ap, "signal"))
+                security = normalize_security(get_value(ap, "security"))
+                display = f"{ssid} | {bssid} | ch {channel} | {signal} | {security}"
+                entries.append({"display": display, "bssid": bssid})
+
+            summary = {"bssids": len(entries)}
+            return {"summary": summary, "items": [], "entries": entries}
 
         def ui_update(payload: Dict[str, Any]) -> None:
-            bssids = payload.get("bssids", [])
-            self.bssid_field.combo.clear()
-            if bssids:
-                self.bssid_field.combo.addItems(bssids)
-            summary = ", ".join(bssids) if bssids else "no BSSIDs detected"
-            self.main_window._append_log_line(f"[wireless] BSSIDs refreshed: {summary}")
+            entries = payload.get("entries", [])
+            self._wifi_entries = entries
+            self._apply_bssid_filter()
+            if entries:
+                self._set_wifi_scan_state(
+                    f"Wi-Fi scan complete: {len(entries)} network(s) found.",
+                    active=False,
+                )
+                self.main_window._append_log_line(
+                    f"[wireless] Wi-Fi scan complete: {len(entries)} network(s) found. BSSID list updated."
+                )
+            else:
+                self._set_wifi_scan_state(
+                    "Wi-Fi scan complete: no networks detected.",
+                    active=False,
+                )
+                self.main_window._append_log_line(
+                    "[wireless] Wi-Fi scan complete: no networks detected. Check adapter mode and permissions."
+                )
 
         job = JobSpec(
             name="Scan Wi-Fi",
@@ -1463,6 +1575,32 @@ class WirelessTab(CategoryTab):
             ui_update=ui_update,
         )
         self.run_job(job)
+
+    def _set_wifi_scan_state(self, message: str, *, active: bool) -> None:
+        self.wifi_scan_status.setText(f"Wi-Fi scan status: {message}")
+        if active:
+            self.wifi_scan_progress.setVisible(True)
+            self.wifi_scan_progress.setRange(0, 0)
+        else:
+            self.wifi_scan_progress.setRange(0, 1)
+            self.wifi_scan_progress.setValue(1)
+            self.wifi_scan_progress.setVisible(False)
+
+    def _apply_bssid_filter(self) -> None:
+        query = self.bssid_filter.text().strip().lower()
+        self.bssid_field.combo.blockSignals(True)
+        self.bssid_field.combo.clear()
+        shown = 0
+        for entry in self._wifi_entries:
+            display = entry.get("display", "")
+            bssid = entry.get("bssid", "")
+            haystack = f"{display} {bssid}".lower()
+            if not query or query in haystack:
+                self.bssid_field.combo.addItem(display, bssid)
+                shown += 1
+        self.bssid_field.combo.blockSignals(False)
+        total = len(self._wifi_entries)
+        self.bssid_filter_status.setText(f"Showing {shown} of {total} networks")
 
     def enable_monitor(self) -> None:
         iface = self.iface()
@@ -1836,6 +1974,688 @@ class WebTab(CategoryTab):
             self.dir_exec_button.setToolTip(reason)
 
 
+
+
+class WSDiscoveryWorker(QThread):
+    """
+    Background worker that performs ONVIF WS-Discovery so the UI stays responsive.
+    """
+    results_ready = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, timeout_s: float = 1.5, retries: int = 2, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._timeout_s = timeout_s
+        self._retries = retries
+
+    def run(self) -> None:
+        try:
+            cams = ws_discover(timeout_s=self._timeout_s, retries=self._retries)
+            self.results_ready.emit([c.as_dict() for c in cams])
+        except Exception as exc:
+            self.error.emit(f"Discovery failed: {exc!r}")
+
+
+class IPCameraTab(QWidget):
+    """
+    Feature-rich IP camera tab:
+    - Supports generic RTSP / HTTP(S) streams via Qt Multimedia (QMediaPlayer).
+    - ONVIF WS-Discovery for device discovery (best-effort).
+    - Snapshot capture.
+    - Motion + tamper detection using frame differencing from QVideoSink.
+    - AlfredCamera compatibility via embedded WebViewer (Qt WebEngine if available).
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._player: Optional[QMediaPlayer] = None
+        self._audio: Optional[QAudioOutput] = None
+        self._video_widget: Optional[QVideoWidget] = None
+        self._sink: Optional[QVideoSink] = None
+
+        self._last_frame_gray = None  # type: ignore[assignment]
+        self._last_motion_ts = 0.0
+        self._motion_armed = False
+        self._tamper_armed = False
+        self._auto_reconnect = True
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 10
+
+        self._settings = QSettings("NetNinja", "NetReaper")
+        self._build_ui()
+        self._load_profiles()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header = QLabel("IP Cameras — Live View, Discovery, Detection")
+        header.setObjectName("sectionTitle")
+        root.addWidget(header)
+
+        top = QHBoxLayout()
+        root.addLayout(top, stretch=1)
+
+        # Left control panel
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        top.addLayout(left, stretch=0)
+
+        conn_box = QGroupBox("Connect")
+        conn_layout = QGridLayout(conn_box)
+        conn_layout.setHorizontalSpacing(8)
+        conn_layout.setVerticalSpacing(8)
+
+        self.profile_combo = QComboBox()
+        self.profile_combo.setEditable(False)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+
+        self.profile_name = QLineEdit()
+        self.profile_name.setPlaceholderText("Profile name (e.g., Front Door)")
+
+        self.stream_type = QComboBox()
+        self.stream_type.addItems(["RTSP", "HTTP(S) (MJPEG/HLS)", "AlfredCamera WebViewer"])
+        self.stream_type.currentIndexChanged.connect(self._on_stream_type_changed)
+
+        self.host_field = QLineEdit()
+        self.host_field.setPlaceholderText("IP or hostname (e.g., 192.168.1.120)")
+        self.port_field = QLineEdit()
+        self.port_field.setPlaceholderText("Port (e.g., 554)")
+        self.port_field.setText("554")
+        self.user_field = QLineEdit()
+        self.user_field.setPlaceholderText("Username (optional)")
+        self.pass_field = QLineEdit()
+        self.pass_field.setPlaceholderText("Password (optional)")
+        self.pass_field.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.url_field = QLineEdit()
+        self.url_field.setPlaceholderText("Full stream URL (if you already have it)")
+
+        self.discover_btn = QPushButton("Discover (ONVIF)")
+        self.discover_btn.clicked.connect(self._discover_onvif)
+
+        self.guess_btn = QPushButton("Guess RTSP URLs")
+        self.guess_btn.clicked.connect(self._guess_urls)
+
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self._connect)
+
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.clicked.connect(self._disconnect)
+
+        self.save_profile_btn = QPushButton("Save / Update Profile")
+        self.save_profile_btn.clicked.connect(self._save_profile)
+
+        self.delete_profile_btn = QPushButton("Delete Profile")
+        self.delete_profile_btn.clicked.connect(self._delete_profile)
+
+        row = 0
+        conn_layout.addWidget(QLabel("Saved profiles"), row, 0)
+        conn_layout.addWidget(self.profile_combo, row, 1, 1, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("Profile name"), row, 0)
+        conn_layout.addWidget(self.profile_name, row, 1, 1, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("Mode"), row, 0)
+        conn_layout.addWidget(self.stream_type, row, 1, 1, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("Host"), row, 0)
+        conn_layout.addWidget(self.host_field, row, 1)
+        conn_layout.addWidget(self.discover_btn, row, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("Port"), row, 0)
+        conn_layout.addWidget(self.port_field, row, 1)
+        conn_layout.addWidget(self.guess_btn, row, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("User"), row, 0)
+        conn_layout.addWidget(self.user_field, row, 1, 1, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("Pass"), row, 0)
+        conn_layout.addWidget(self.pass_field, row, 1, 1, 2)
+        row += 1
+
+        conn_layout.addWidget(QLabel("URL"), row, 0)
+        conn_layout.addWidget(self.url_field, row, 1, 1, 2)
+        row += 1
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.connect_btn)
+        buttons.addWidget(self.disconnect_btn)
+        left.addWidget(conn_box)
+        left.addLayout(buttons)
+
+        prof_btns = QHBoxLayout()
+        prof_btns.addWidget(self.save_profile_btn)
+        prof_btns.addWidget(self.delete_profile_btn)
+        left.addLayout(prof_btns)
+
+        detect_box = QGroupBox("Detection (Local)")
+        dlay = QGridLayout(detect_box)
+        dlay.setHorizontalSpacing(8)
+        dlay.setVerticalSpacing(8)
+
+        self.motion_toggle = QCheckBox("Motion detection")
+        self.motion_toggle.stateChanged.connect(self._toggle_motion)
+
+        self.tamper_toggle = QCheckBox("Tamper / blackout detection")
+        self.tamper_toggle.stateChanged.connect(self._toggle_tamper)
+
+        self.sensitivity = QComboBox()
+        self.sensitivity.addItems(["Low", "Medium", "High"])
+        self.sensitivity.setCurrentIndex(1)
+
+        self.cooldown = QComboBox()
+        self.cooldown.addItems(["0s", "1s", "3s", "5s", "10s"])
+        self.cooldown.setCurrentIndex(2)
+
+        self.snapshot_btn = QPushButton("Snapshot")
+        self.snapshot_btn.clicked.connect(self._snapshot)
+
+        self.auto_reconnect_cb = QCheckBox("Auto reconnect")
+        self.auto_reconnect_cb.setChecked(True)
+        self.auto_reconnect_cb.stateChanged.connect(self._toggle_reconnect)
+
+        drow = 0
+        dlay.addWidget(self.motion_toggle, drow, 0, 1, 2)
+        drow += 1
+        dlay.addWidget(self.tamper_toggle, drow, 0, 1, 2)
+        drow += 1
+        dlay.addWidget(QLabel("Sensitivity"), drow, 0)
+        dlay.addWidget(self.sensitivity, drow, 1)
+        drow += 1
+        dlay.addWidget(QLabel("Cooldown"), drow, 0)
+        dlay.addWidget(self.cooldown, drow, 1)
+        drow += 1
+        dlay.addWidget(self.auto_reconnect_cb, drow, 0, 1, 2)
+        drow += 1
+        dlay.addWidget(self.snapshot_btn, drow, 0, 1, 2)
+
+        left.addWidget(detect_box)
+
+        self.status = QLabel("Status: idle")
+        self.status.setObjectName("mutedLabel")
+        left.addWidget(self.status)
+
+        self.event_log = QPlainTextEdit()
+        self.event_log.setReadOnly(True)
+        self.event_log.setMinimumWidth(360)
+        self.event_log.setPlaceholderText("Detection + connection events will appear here.")
+        left.addWidget(self.event_log, stretch=1)
+
+        # Right view panel (video / embedded web)
+        self.view_stack = QStackedWidget()
+        top.addWidget(self.view_stack, stretch=1)
+
+        # Video view
+        video_container = QWidget()
+        video_layout = QVBoxLayout(video_container)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        self._video_widget = QVideoWidget()
+        video_layout.addWidget(self._video_widget, stretch=1)
+        self.view_stack.addWidget(video_container)
+
+        # Alfred view (Qt WebEngine; fall back to external browser)
+        self.alfred_container = QWidget()
+        al = QVBoxLayout(self.alfred_container)
+        al.setContentsMargins(0, 0, 0, 0)
+        self.alfred_hint = QLabel(
+            "AlfredCamera runs primarily through its own app and WebViewer.\n"
+            "Use this mode to open Alfred's WebViewer inside NetReaper (when supported) or launch it in your browser.\n"
+            "Tip: you must sign in with the same Alfred account as your camera device.\n"
+        )
+        self.alfred_hint.setWordWrap(True)
+        al.addWidget(self.alfred_hint)
+
+        self.open_alfred_btn = QPushButton("Open Alfred WebViewer")
+        self.open_alfred_btn.clicked.connect(self._open_alfred)
+
+        # Ensure camera action buttons are always readable and not "mystery blanks" under any platform theme.
+        for _b in (
+            self.discover_btn,
+            self.guess_btn,
+            self.connect_btn,
+            self.disconnect_btn,
+            self.save_profile_btn,
+            self.delete_profile_btn,
+            self.snapshot_btn,
+            self.open_alfred_btn,
+        ):
+            _b.setMinimumHeight(36)
+            _b.setCursor(Qt.CursorShape.PointingHandCursor)
+            _b.setProperty("camAction", "true")
+
+        al.addWidget(self.open_alfred_btn)
+
+        self.alfred_web_placeholder = QLabel("WebViewer panel will appear here if Qt WebEngine is available.")
+        self.alfred_web_placeholder.setWordWrap(True)
+        al.addWidget(self.alfred_web_placeholder, stretch=1)
+        self.view_stack.addWidget(self.alfred_container)
+
+        self.view_stack.setCurrentIndex(0)
+        self._on_stream_type_changed()
+
+    def _log(self, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        self.event_log.appendPlainText(f"[{ts}] {msg}")
+        self.event_log.verticalScrollBar().setValue(self.event_log.verticalScrollBar().maximum())
+
+    def _set_status(self, msg: str) -> None:
+        self.status.setText(f"Status: {msg}")
+
+    def _profiles_key(self) -> str:
+        return "ip_camera/profiles_v1"
+
+    def _load_profiles(self) -> None:
+        raw = self._settings.value(self._profiles_key(), defaultValue="[]")
+        try:
+            profs = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            profs = []
+        if not isinstance(profs, list):
+            profs = []
+        self._profiles = profs  # type: ignore[assignment]
+
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("(select)", userData=None)
+        for p in self._profiles:
+            name = str(p.get("name", "Unnamed"))
+            self.profile_combo.addItem(name, userData=p)
+        self.profile_combo.blockSignals(False)
+
+    def _save_profiles(self) -> None:
+        self._settings.setValue(self._profiles_key(), json.dumps(self._profiles))
+
+    def _on_profile_selected(self) -> None:
+        p = self.profile_combo.currentData()
+        if not isinstance(p, dict):
+            return
+        self.profile_name.setText(str(p.get("name", "")))
+        self.stream_type.setCurrentText(str(p.get("mode", "RTSP")))
+        self.host_field.setText(str(p.get("host", "")))
+        self.port_field.setText(str(p.get("port", "554")))
+        self.user_field.setText(str(p.get("username", "")))
+        self.pass_field.setText(str(p.get("password", "")))
+        self.url_field.setText(str(p.get("url", "")))
+        self._on_stream_type_changed()
+
+    def _save_profile(self) -> None:
+        name = self.profile_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Please provide a profile name.")
+            return
+
+        p = {
+            "name": name,
+            "mode": self.stream_type.currentText(),
+            "host": self.host_field.text().strip(),
+            "port": self.port_field.text().strip(),
+            "username": self.user_field.text(),
+            "password": self.pass_field.text(),
+            "url": self.url_field.text().strip(),
+        }
+
+        replaced = False
+        for i, old in enumerate(self._profiles):
+            if str(old.get("name", "")).strip().lower() == name.lower():
+                self._profiles[i] = p
+                replaced = True
+                break
+        if not replaced:
+            self._profiles.append(p)
+
+        self._save_profiles()
+        self._load_profiles()
+        self._log(f"Saved profile: {name}")
+
+    def _delete_profile(self) -> None:
+        p = self.profile_combo.currentData()
+        if not isinstance(p, dict):
+            QMessageBox.information(self, "Delete Profile", "Select a profile first.")
+            return
+        name = str(p.get("name", "")).strip()
+        if not name:
+            return
+        self._profiles = [x for x in self._profiles if str(x.get("name", "")).strip().lower() != name.lower()]
+        self._save_profiles()
+        self._load_profiles()
+        self._log(f"Deleted profile: {name}")
+
+    def _toggle_motion(self) -> None:
+        self._motion_armed = bool(self.motion_toggle.isChecked())
+        self._log(f"Motion detection {'enabled' if self._motion_armed else 'disabled'}")
+
+    def _toggle_tamper(self) -> None:
+        self._tamper_armed = bool(self.tamper_toggle.isChecked())
+        self._log(f"Tamper detection {'enabled' if self._tamper_armed else 'disabled'}")
+
+    def _toggle_reconnect(self) -> None:
+        self._auto_reconnect = bool(self.auto_reconnect_cb.isChecked())
+        self._log(f"Auto reconnect {'enabled' if self._auto_reconnect else 'disabled'}")
+
+    def _cooldown_seconds(self) -> float:
+        txt = self.cooldown.currentText().replace("s", "").strip()
+        try:
+            return float(txt)
+        except Exception:
+            return 3.0
+
+    def _motion_threshold(self) -> float:
+        level = self.sensitivity.currentText()
+        if level == "Low":
+            return 0.10
+        if level == "High":
+            return 0.03
+        return 0.06
+
+    def _on_stream_type_changed(self) -> None:
+        mode = self.stream_type.currentText()
+        if mode == "AlfredCamera WebViewer":
+            self.view_stack.setCurrentIndex(1)
+            self._disconnect()
+            self._set_status("Alfred mode ready")
+        else:
+            self.view_stack.setCurrentIndex(0)
+
+    def _discover_onvif(self) -> None:
+        self._set_status("discovering ONVIF devices…")
+        self._log("Starting ONVIF WS-Discovery…")
+        self.discover_btn.setEnabled(False)
+
+        self._disc_worker = WSDiscoveryWorker(timeout_s=1.8, retries=3, parent=self)
+        self._disc_worker.results_ready.connect(self._on_discovery_results)
+        self._disc_worker.error.connect(self._on_discovery_error)
+        self._disc_worker.finished.connect(lambda: self.discover_btn.setEnabled(True))
+        self._disc_worker.start()
+
+    def _on_discovery_error(self, msg: str) -> None:
+        self._set_status("discovery failed")
+        self._log(msg)
+        QMessageBox.warning(self, "Discovery Failed", msg)
+
+    def _on_discovery_results(self, cams: list) -> None:
+        self._set_status(f"discovered {len(cams)} device(s)")
+        if not cams:
+            self._log("No ONVIF devices found.")
+            QMessageBox.information(
+                self,
+                "Discovery",
+                "No ONVIF devices were found via WS-Discovery.\n\n"
+                "This is common if the camera disables ONVIF or is on a different VLAN/subnet.",
+            )
+            return
+
+        menu = QMenu(self)
+        for c in cams:
+            ip = str(c.get("ip", ""))
+            xaddrs = c.get("xaddrs", [])
+            label = ip if ip else (xaddrs[0] if xaddrs else "Unknown device")
+            act = menu.addAction(label)
+            act.setData(c)
+
+        chosen = menu.exec(self.discover_btn.mapToGlobal(self.discover_btn.rect().bottomLeft()))
+        if not chosen:
+            return
+        data = chosen.data()
+        if isinstance(data, dict):
+            self.host_field.setText(str(data.get("ip", "")))
+            self._log(f"Selected device: {data.get('ip','')}")
+            xaddrs = data.get("xaddrs", [])
+            if xaddrs and not self.url_field.text().strip():
+                self.url_field.setText(str(xaddrs[0]))
+
+    def _guess_urls(self) -> None:
+        ip = self.host_field.text().strip()
+        if not ip:
+            QMessageBox.warning(self, "Missing Host", "Enter a camera IP/host first.")
+            return
+
+        try:
+            port = int(self.port_field.text().strip() or "554")
+        except ValueError:
+            port = 554
+
+        candidates = guess_rtsp_urls(
+            ip=ip,
+            username=self.user_field.text().strip(),
+            password=self.pass_field.text(),
+            port=port,
+        )
+        menu = QMenu(self)
+        for u in candidates:
+            act = menu.addAction(u)
+            act.setData(u)
+
+        chosen = menu.exec(self.guess_btn.mapToGlobal(self.guess_btn.rect().bottomLeft()))
+        if chosen:
+            val = chosen.data()
+            if isinstance(val, str):
+                self.url_field.setText(val)
+                self.stream_type.setCurrentText("RTSP")
+                self._log("Inserted candidate RTSP URL from templates.")
+
+    def _stream_url(self) -> Optional[str]:
+        mode = self.stream_type.currentText()
+        url = self.url_field.text().strip()
+
+        if mode == "AlfredCamera WebViewer":
+            return None
+
+        if url:
+            return url
+
+        host = self.host_field.text().strip()
+        if not host:
+            return None
+
+        port = self.port_field.text().strip()
+        username = self.user_field.text().strip()
+        password = self.pass_field.text()
+
+        if mode == "RTSP":
+            try:
+                port_i = int(port) if port else 554
+            except ValueError:
+                port_i = 554
+            return guess_rtsp_urls(host, username=username, password=password, port=port_i)[0]
+
+        if port:
+            return f"http://{host}:{port}/"
+        return f"http://{host}/"
+
+    def _ensure_player(self) -> None:
+        if self._player is not None:
+            return
+        self._player = QMediaPlayer(self)
+        self._audio = QAudioOutput(self)
+        self._player.setAudioOutput(self._audio)
+
+        self._sink = QVideoSink(self)
+        self._sink.videoFrameChanged.connect(self._on_frame)
+        self._player.setVideoOutput(self._sink)
+        if self._video_widget is not None:
+            try:
+                self._player.setVideoOutput(self._video_widget)
+            except Exception:
+                pass
+
+        self._player.errorOccurred.connect(self._on_player_error)
+        self._player.mediaStatusChanged.connect(self._on_media_status)
+
+    def _connect(self) -> None:
+        mode = self.stream_type.currentText()
+        if mode == "AlfredCamera WebViewer":
+            self._open_alfred()
+            return
+
+        url = self._stream_url()
+        if not url:
+            QMessageBox.warning(
+                self,
+                "Missing Stream",
+                "Provide either a full stream URL, or a host (and port/user/pass if needed).",
+            )
+            return
+
+        self._ensure_player()
+        assert self._player is not None
+
+        self._reconnect_attempts = 0
+        self._set_status("connecting…")
+        self._log(f"Connecting to: {url}")
+
+        self._player.setSource(QUrl(url))
+        self._player.play()
+
+    def _disconnect(self) -> None:
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+        self._set_status("disconnected")
+        self._log("Disconnected.")
+
+    def _on_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+            self._set_status("loaded")
+        elif status == QMediaPlayer.MediaStatus.BufferedMedia:
+            self._set_status("buffered")
+        elif status == QMediaPlayer.MediaStatus.StalledMedia:
+            self._set_status("stalled")
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._set_status("ended")
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            self._set_status("invalid media")
+
+    def _on_player_error(self, err: QMediaPlayer.Error, error_string: str) -> None:
+        self._set_status("error")
+        self._log(f"Playback error: {error_string}")
+        if not self._auto_reconnect:
+            return
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            self._log("Auto reconnect stopped (max attempts reached).")
+            return
+        self._reconnect_attempts += 1
+        wait_ms = min(5000, 500 * self._reconnect_attempts)
+        self._log(f"Retrying in {wait_ms} ms (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})…")
+        QTimer.singleShot(wait_ms, self._connect)
+
+    def _on_frame(self, frame) -> None:
+        if not (self._motion_armed or self._tamper_armed):
+            return
+        try:
+            img = frame.toImage()
+        except Exception:
+            return
+        if img.isNull():
+            return
+
+        img = img.scaled(160, 90, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+
+        try:
+            import numpy as _np  # type: ignore
+            ptr = img.bits()
+            ptr.setsize(img.sizeInBytes())
+            arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape((img.height(), img.width(), 4))
+            gray = (0.299 * arr[:, :, 2] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 0]).astype(_np.uint8)
+            mean_brightness = float(gray.mean())
+        except Exception:
+            w, h = img.width(), img.height()
+            total = 0
+            step = 4
+            count = 0
+            for y in range(0, h, step):
+                for x in range(0, w, step):
+                    c = img.pixelColor(x, y)
+                    total += int(0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue())
+                    count += 1
+            if count <= 0:
+                return
+            mean_brightness = total / count
+            gray = None
+
+        now = time.time()
+        cooldown = self._cooldown_seconds()
+
+        if self._tamper_armed and mean_brightness < 12.0 and (now - self._last_motion_ts) > cooldown:
+            self._last_motion_ts = now
+            self._log("TAMPER: Scene is near-black (possible cover / blackout).")
+            self._set_status("tamper alert")
+
+        if not self._motion_armed:
+            self._last_frame_gray = gray
+            return
+
+        if gray is None:
+            return
+
+        if self._last_frame_gray is None:
+            self._last_frame_gray = gray
+            return
+
+        try:
+            import numpy as _np  # type: ignore
+            diff = _np.abs(gray.astype(_np.int16) - self._last_frame_gray.astype(_np.int16)).astype(_np.uint8)
+            changed = float((diff > 18).mean())
+        except Exception:
+            self._last_frame_gray = gray
+            return
+
+        self._last_frame_gray = gray
+        if changed >= self._motion_threshold() and (now - self._last_motion_ts) > cooldown:
+            self._last_motion_ts = now
+            self._log(f"MOTION: change={changed:.3f} (threshold={self._motion_threshold():.3f})")
+            self._set_status("motion detected")
+
+    def _snapshot(self) -> None:
+        if self._sink is None:
+            QMessageBox.information(self, "Snapshot", "Connect to a camera first.")
+            return
+        frame = self._sink.videoFrame()
+        if frame is None or not frame.isValid():
+            QMessageBox.information(self, "Snapshot", "No video frame available yet.")
+            return
+        img = frame.toImage()
+        if img.isNull():
+            QMessageBox.information(self, "Snapshot", "Snapshot failed (invalid image).")
+            return
+
+        out_dir = Path.home() / "NetNinja_Snapshots"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fname = time.strftime("snapshot_%Y%m%d_%H%M%S.png")
+        out_path = out_dir / fname
+        ok = img.save(str(out_path))
+        if ok:
+            self._log(f"Saved snapshot: {out_path}")
+            QMessageBox.information(self, "Snapshot Saved", f"Saved to:\n{out_path}")
+        else:
+            QMessageBox.warning(self, "Snapshot", "Failed to save snapshot.")
+
+    def _open_alfred(self) -> None:
+        url = "https://alfred.camera/webapp/viewer"
+        try:
+            from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore
+            if not hasattr(self, "_alfred_web"):
+                self._alfred_web = QWebEngineView(self.alfred_container)  # type: ignore[attr-defined]
+                self.alfred_container.layout().addWidget(self._alfred_web)  # type: ignore[union-attr]
+            self._alfred_web.setUrl(QUrl(url))  # type: ignore[attr-defined]
+            self._set_status("Alfred WebViewer open")
+            self._log("Opened Alfred WebViewer (embedded).")
+        except Exception:
+            QDesktopServices.openUrl(QUrl(url))
+            self._set_status("Alfred WebViewer opened in browser")
+            self._log("Opened Alfred WebViewer in external browser (Qt WebEngine not available).")
+
+
+
 class ToolsTab(CategoryTab):
     """TOOLS tab for system and network utilities."""
 
@@ -1947,6 +2767,10 @@ class NetReaperGui(QWidget):
 
         # Toolbar
         self.toolbar = QToolBar("Actions")
+        # Match reference: a slim text-only command strip.
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         clear_log_action = QAction("Clear log", self)
         clear_log_action.triggered.connect(self.clear_log)
         self.wiring_flags["clear_log_action"] = True
@@ -1981,6 +2805,16 @@ class NetReaperGui(QWidget):
         self.reaper_header = ReaperHeader()
         main_layout.addWidget(self.reaper_header)
 
+        # Ensure the window width can display the header exactly as designed (no scaling/distortion).
+        try:
+            ref = self.reaper_header.reference_size()
+            self.setMinimumWidth(max(self.minimumWidth(), ref.width()))
+            if self.width() < ref.width():
+                self.resize(ref.width(), self.height())
+        except Exception:
+            pass
+
+
         self.hud_panel = HUDPanel()
         main_layout.addWidget(self.hud_panel)
 
@@ -1995,10 +2829,25 @@ class NetReaperGui(QWidget):
         nav_label.setStyleSheet("font-weight: 700;")
         nav_layout.addWidget(nav_label)
 
+<<<<<<< HEAD
         def add_quick_action(label: str, handler) -> None:
             btn = QPushButton(label)
             btn.clicked.connect(handler)
             ButtonStyleRegistry.apply(btn, "control")
+=======
+        # Internal navigation list (kept for keyboard navigation / state tracking).
+        # The reference UI does not expose this list visually.
+        self.nav_list = QListWidget()
+        self.nav_list.setObjectName("navList")
+        self.nav_list.setVisible(False)
+        nav_layout.addWidget(self.nav_list)
+
+        def add_quick_action(label: str, handler) -> None:
+            btn = QPushButton(label)
+            btn.clicked.connect(handler)
+            # Styled by QSS to match reference "Quick Actions" pill buttons.
+            btn.setProperty("quickAction", "true")
+>>>>>>> 6f416e2758bfd1811a9204f250cf9d9ec507652f
             nav_layout.addWidget(btn)
 
         add_quick_action("Console Focus", lambda: self.output_log.setFocus())
@@ -2028,6 +2877,7 @@ class NetReaperGui(QWidget):
         self.recon_tab = ReconTab(self.submit_command_job, self)
         self.wireless_tab = WirelessTab(self.submit_command_job, self)
         self.web_tab = WebTab(self.submit_command_job, self)
+        self.camera_tab = IPCameraTab(self)
         self.tools_tab = ToolsTab(self.submit_command_job, self)
         self.wizard_tab = WizardTab(self.submit_command_job, self)
         self.jobs_tab = JobsTab(self.job_manager, self.save_diagnostics, self.run_self_test, self)
@@ -2040,6 +2890,7 @@ class NetReaperGui(QWidget):
             ("Recon", self.recon_tab),
             ("Wireless", self.wireless_tab),
             ("Web", self.web_tab),
+            ("Cameras", self.camera_tab),
             ("Tools", self.tools_tab),
             ("Wizards", wizard_page),
             ("Jobs", jobs_page),
@@ -2059,6 +2910,7 @@ class NetReaperGui(QWidget):
         self.reaper_header.add_nav_button("Recon", lambda: self.navigate_to("Recon"))
         self.reaper_header.add_nav_button("Wireless", lambda: self.navigate_to("Wireless"))
         self.reaper_header.add_nav_button("Web", lambda: self.navigate_to("Web"))
+        self.reaper_header.add_nav_button("Cameras", lambda: self.navigate_to("Cameras"))
         self.reaper_header.add_nav_button("Tools", lambda: self.navigate_to("Tools"))
         self.reaper_header.add_nav_button("Wizards", lambda: self.navigate_to("Wizards"))
         self.reaper_header.add_nav_button("Jobs", lambda: self.navigate_to("Jobs"))

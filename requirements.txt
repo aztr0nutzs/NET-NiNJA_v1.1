@@ -25,3 +25,6 @@ pip-audit>=2.6.0
 # Type checking (optional, for development)
 mypy>=1.7.0
 types-PyYAML>=6.0.12
+
+# Camera detection helpers
+numpy>=1.24.0

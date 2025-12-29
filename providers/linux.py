@@ -119,13 +119,25 @@ class LinuxProvider(BaseProvider):
         return records
 
     def scan_wifi(self) -> List[WifiAPRecord]:
-        cmd = ["nmcli", "-t", "-f", "SSID,BSSID,CHAN,SIGNAL,SECURITY", "dev", "wifi", "list", "--rescan", "yes"]
+        cmd = [
+            "nmcli",
+            "-t",
+            "--separator",
+            "|",
+            "-f",
+            "SSID,BSSID,CHAN,SIGNAL,SECURITY",
+            "dev",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+        ]
         output = self._run_text(cmd, timeout=12)
         records: List[WifiAPRecord] = []
         for raw in output.splitlines():
             if not raw.strip():
                 continue
-            parts = raw.rsplit(":", 4)
+            parts = raw.split("|", 4)
             if len(parts) != 5:
                 continue
             ssid, bssid, chan, signal, security = [p.strip() for p in parts]
