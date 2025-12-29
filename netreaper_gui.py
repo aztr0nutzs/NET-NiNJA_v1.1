@@ -218,19 +218,70 @@ class ReaperHeader(QFrame):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setObjectName("ReaperHeader")
-        self.setFrameShape(QFrame.NoFrame)
+        self.setObjectName("reaperHeader")
+        self.setFrameShape(QFrame.Shape.NoFrame)
 
         ref_path = resource_path("imgs/header_reference.png")
         self._pix = QPixmap(ref_path)
-
-        # Hard fail early with a clear message if the asset is missing.
         if self._pix.isNull():
-            raise FileNotFoundError(f"Missing header reference image: {ref_path}")
+            # Fall back to a simple placeholder header if the reference asset is missing.
+            print(f"Warning: missing header reference image: {ref_path}", file=sys.stderr)
+            self._pix = QPixmap(800, 120)
+            self._pix.fill(QColor(0, 0, 0))
+            painter = QPainter(self._pix)
+            painter.setPen(QColor(0, 220, 255))
+            painter.drawText(self._pix.rect(), Qt.AlignmentFlag.AlignCenter, "NET-NiNJA")
+            painter.end()
 
         # Lock height to the exact reference height. Width is handled via window sizing/min width.
         self.setFixedHeight(self._pix.height())
         self.setMinimumWidth(self._pix.width())
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 10, 16, 10)
+        outer.setSpacing(6)
+
+        self.stats_container = QFrame()
+        self.stats_container.setObjectName("reaperStats")
+        stats_layout = QHBoxLayout(self.stats_container)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(14)
+
+        def make_pair(label_text: str) -> Tuple[QLabel, QLabel]:
+            label = QLabel(label_text)
+            label.setObjectName("headerMeta")
+            value = QLabel("-")
+            value.setObjectName("headerMetaStrong")
+            return label, value
+
+        session_label, self.session_value = make_pair("SESSION")
+        target_label, self.target_value = make_pair("TARGET")
+        ingress_label, self.ingress_value = make_pair("INGRESS")
+        jobs_label, self.jobs_value = make_pair("JOBS")
+
+        for label, value in (
+            (session_label, self.session_value),
+            (target_label, self.target_value),
+            (ingress_label, self.ingress_value),
+            (jobs_label, self.jobs_value),
+        ):
+            stats_layout.addWidget(label)
+            stats_layout.addWidget(value)
+
+        stats_layout.addStretch()
+        outer.addWidget(self.stats_container)
+
+        rule = QFrame()
+        rule.setObjectName("headerRule")
+        rule.setFixedHeight(1)
+        outer.addWidget(rule)
+
+        self.nav_container = QFrame()
+        nav_layout = QHBoxLayout(self.nav_container)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(8)
+        self._nav_layout = nav_layout
+        outer.addWidget(self.nav_container)
 
     def reference_size(self) -> QSize:
         return self._pix.size()
@@ -245,6 +296,18 @@ class ReaperHeader(QFrame):
         painter.fillRect(self.rect(), QColor(0, 0, 0))
         painter.drawPixmap(0, 0, self._pix)
         painter.end()
+
+    def add_nav_button(self, label: str, handler) -> None:
+        btn = QPushButton(label)
+        btn.clicked.connect(handler)
+        btn.setProperty("navRole", label.lower())
+        self._nav_layout.addWidget(btn)
+
+    def update_stats(self, session_id: str, target: str, ingress_online: bool, active_jobs: int) -> None:
+        self.session_value.setText(session_id or "-")
+        self.target_value.setText(target or "-")
+        self.ingress_value.setText("ONLINE" if ingress_online else "OFFLINE")
+        self.jobs_value.setText(str(active_jobs))
 
 class TargetField(QWidget):
     """Reusable target selector with editable combo box."""
@@ -2829,12 +2892,6 @@ class NetReaperGui(QWidget):
         nav_label.setStyleSheet("font-weight: 700;")
         nav_layout.addWidget(nav_label)
 
-<<<<<<< HEAD
-        def add_quick_action(label: str, handler) -> None:
-            btn = QPushButton(label)
-            btn.clicked.connect(handler)
-            ButtonStyleRegistry.apply(btn, "control")
-=======
         # Internal navigation list (kept for keyboard navigation / state tracking).
         # The reference UI does not expose this list visually.
         self.nav_list = QListWidget()
@@ -2847,7 +2904,6 @@ class NetReaperGui(QWidget):
             btn.clicked.connect(handler)
             # Styled by QSS to match reference "Quick Actions" pill buttons.
             btn.setProperty("quickAction", "true")
->>>>>>> 6f416e2758bfd1811a9204f250cf9d9ec507652f
             nav_layout.addWidget(btn)
 
         add_quick_action("Console Focus", lambda: self.output_log.setFocus())
